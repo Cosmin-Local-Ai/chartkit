@@ -1,0 +1,14 @@
+[
+  {
+    "_provenance": "synthesized from the response properties on https://www.interactivebrokers.com/docs/web-api/v1/endpoints/contract/search-contract-by-symbol.md",
+    "conid": "265598",
+    "companyHeader": "APPLE INC (NASDAQ)",
+    "companyName": "APPLE INC",
+    "symbol": "AAPL",
+    "description": "NASDAQ",
+    "restricted": false,
+    "sections": [
+      { "secType": "STK", "months": "", "symbol": "AAPL", "exchange": "NASDAQ;SMART;ARCA" }
+    ]
+  }
+]

@@ -1,0 +1,16 @@
+{
+  "_provenance": "synthesized: the transcribed smd shape with field 6509 'DB' (Delayed + Snapshot + Book) and the documented size fields 85 ask size, 88 bid size, 7059 last size",
+  "server_id": "smd265598",
+  "conidEx": "265598",
+  "conid": 265598,
+  "_updated": 1699885860500,
+  "6119": "smd265598",
+  "31": "182.30",
+  "7059": "100",
+  "84": "182.28",
+  "88": "300",
+  "86": "182.32",
+  "85": "200",
+  "6509": "DB",
+  "topic": "smd+265598"
+}

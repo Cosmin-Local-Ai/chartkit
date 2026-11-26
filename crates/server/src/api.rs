@@ -8,6 +8,7 @@ use chartkit_core::{
     new_id, Alert, AlertKind, AssetClass, FootprintSeries, FootprintSeriesBuilder, Timeframe,
     VolumeProfile, VolumeProfileBuilder,
 };
+use chartkit_ingest::credentials::venue_from_slug;
 use chartkit_store::{BarFilter, StoreError};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -49,6 +50,36 @@ impl IntoResponse for ApiError {
         };
         (status, reason).into_response()
     }
+}
+
+/// Every routable venue, whether it has credentials, and which fields it needs. Secrets
+/// are reported as set or unset; their values never leave the server.
+pub async fn feeds(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "venues": state.feeds.statuses(),
+        "credentialFile": state.feeds.data_dir().join("feeds.json"),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct FeedPatch {
+    pub venue: String,
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, String>,
+}
+
+/// Save credentials typed into the settings panel. An empty value clears that field.
+pub async fn save_feeds(
+    State(state): State<AppState>,
+    Json(patch): Json<FeedPatch>,
+) -> Result<Json<Value>, ApiError> {
+    let venue = venue_from_slug(&patch.venue)
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown venue {}", patch.venue)))?;
+    let statuses = state
+        .feeds
+        .save(venue, &patch.values)
+        .map_err(ApiError::BadRequest)?;
+    Ok(Json(json!({ "venues": statuses })))
 }
 
 pub async fn health(State(state): State<AppState>) -> Json<Value> {

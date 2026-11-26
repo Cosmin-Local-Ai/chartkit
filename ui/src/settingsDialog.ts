@@ -1,4 +1,5 @@
 import { el } from './canvasKit';
+import type { FeedReport, FeedVenue } from './api';
 import { API_ROW_CAP } from './dataExport';
 import { readWorkspaceFile, WORKSPACE_FILE_EXTENSION, WORKSPACE_SCHEMA_VERSION } from './workspaceFile';
 import type { WorkspaceFileRead, WorkspaceFileSummary } from './workspaceFile';
@@ -39,6 +40,10 @@ export interface SettingsDialogHandlers {
   onExportPrints: (range: PrintRange) => Promise<string>;
   /** Time span the bars in view cover, used to prefill the prints range. */
   visibleRange: () => { from: number; to: number };
+  /** Data feeds: the credential state of every venue the server can route to. */
+  feeds: () => Promise<FeedReport>;
+  /** Sends only the fields the trader edited, so an untouched field is never cleared. */
+  onSaveFeed: (venue: string, values: Record<string, string>) => Promise<FeedVenue[]>;
 }
 
 /** Prints window to export. A null bound means "whatever the server holds". */
@@ -47,11 +52,12 @@ export interface PrintRange {
   to: number | null;
 }
 
-type Page = 'appearance' | 'data' | 'timezone' | 'latency' | 'templates' | 'backup';
+type Page = 'appearance' | 'data' | 'feeds' | 'timezone' | 'latency' | 'templates' | 'backup';
 
 const PAGES: { id: Page; label: string }[] = [
   { id: 'appearance', label: 'Appearance' },
   { id: 'data', label: 'Chart data' },
+  { id: 'feeds', label: 'Data feeds' },
   { id: 'timezone', label: 'Timezone' },
   { id: 'latency', label: 'Latency' },
   { id: 'templates', label: 'Templates' },
@@ -288,6 +294,96 @@ export class SettingsDialog {
   }
 
   /** Zone picker: the short list, plus any other IANA name typed in. */
+  /**
+   * One row per venue the server can route to. Secrets never travel back to the browser, so
+   * a password box starts empty and only replaces the stored value when something is typed.
+   */
+  private feedBlock(): HTMLElement {
+    const block = el('div', 'set-feeds');
+    const note = el('p', 'set-note', 'Reading feed settings…');
+    block.append(note);
+    void (async () => {
+      try {
+        const report = await this.handlers.feeds();
+        note.textContent = `Stored in ${report.credentialFile}, and overridden by the environment when those variables are set.`;
+        for (const venue of report.venues) block.append(this.feedRow(venue));
+      } catch (error) {
+        note.textContent = `Could not read the feed settings: ${String(error)}`;
+      }
+    })();
+    return block;
+  }
+
+  private feedRow(venue: FeedVenue): HTMLElement {
+    const row = el('div', 'feed-venue');
+    const head = el('div', 'feed-head');
+    head.append(el('span', 'feed-name', venue.tag));
+    const state = el('span', 'feed-state');
+    const paint = (configured: boolean, source: string, missing: string[]): void => {
+      state.dataset.state = configured ? 'ok' : 'missing';
+      state.textContent = configured
+        ? `configured · from ${source}`
+        : `not configured — waiting for ${missing.join(', ')}`;
+    };
+    paint(venue.configured, venue.source, venue.missing);
+    head.append(state);
+    row.append(head, el('p', 'set-note', venue.note));
+
+    const fields = el('div', 'feed-fields');
+    const inputs = new Map<string, { input: HTMLInputElement; initial: string }>();
+    for (const field of venue.fields) {
+      const wrap = el('label', 'ind-field');
+      wrap.append(el('span', 'ind-field-label', field.required ? field.label : `${field.label} (optional)`));
+      const input = el('input', 'dialog-input');
+      input.type = field.secret ? 'password' : 'text';
+      const stored = venue.values[field.key] ?? '';
+      // A required secret counts as set when the server no longer lists it as missing.
+      const alreadySet = field.required && !venue.missing.includes(field.label);
+      input.value = field.secret ? '' : stored;
+      input.placeholder =
+        field.secret && alreadySet ? 'set — type to replace' : field.placeholder || (field.required ? 'required' : '');
+      input.title = `${field.env} overrides what is stored here`;
+      wrap.append(input);
+      fields.append(wrap);
+      inputs.set(field.key, { input, initial: field.secret ? '' : stored });
+    }
+    row.append(fields);
+
+    const actions = el('div', 'set-io-row');
+    const save = el('button', 'dialog-accept', 'Save');
+    save.type = 'button';
+    const status = el('span', 'set-note', '');
+    actions.append(save, status, el('span', 'feed-check', `chartkit --check-feed ${venue.slug}`));
+    row.append(actions);
+
+    save.addEventListener('click', () => {
+      const values: Record<string, string> = {};
+      for (const [key, entry] of inputs) {
+        const text = entry.input.value.trim();
+        // Only edited fields go back, so a field left alone keeps its stored value.
+        if (text !== entry.initial) values[key] = text;
+      }
+      if (Object.keys(values).length === 0) {
+        status.textContent = 'Nothing to save.';
+        return;
+      }
+      save.disabled = true;
+      status.textContent = 'Saving…';
+      void (async () => {
+        try {
+          const venues = await this.handlers.onSaveFeed(venue.venue, values);
+          const updated = venues.find((entry) => entry.venue === venue.venue);
+          if (updated) paint(updated.configured, updated.source, updated.missing);
+          status.textContent = `Saved ${Object.keys(values).length} field${Object.keys(values).length === 1 ? '' : 's'}.`;
+        } catch (error) {
+          status.textContent = String(error);
+        }
+        save.disabled = false;
+      })();
+    });
+    return row;
+  }
+
   private zoneBlock(): HTMLElement {
     const settings = this.handlers.settings();
     const block = el('div', 'set-zone');
@@ -712,6 +808,15 @@ export class SettingsDialog {
             },
             { kind: 'number', field: 'visibleBars', label: 'Bars in a framed view', min: 20, max: 2000, step: 10 },
           ],
+        },
+      ];
+    }
+    if (page === 'feeds') {
+      return [
+        {
+          title: 'Logins and endpoints',
+          note: 'Your own paid data, your own logins. The server reads each value from its environment variable first and then from a file on this machine; nothing is compiled in, and a venue with no credentials reports that instead of failing or pretending to stream.',
+          fields: [{ kind: 'custom', render: (d) => d.feedBlock() }],
         },
       ];
     }

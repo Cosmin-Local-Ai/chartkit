@@ -326,6 +326,8 @@ export class ChartApp {
         offsetMinutes: Math.round(this.local.offsetFor(Date.now()) / 60_000),
         instrumentZone: this.instrument?.session.timezone ?? '',
       }),
+      feeds: () => api.feeds(),
+      onSaveFeed: (venue, values) => api.saveFeeds(venue, values).then((report) => report.venues),
       onExportWorkspace: () => this.exportWorkspace(),
       onImportWorkspace: (state) => this.importWorkspace(state),
       onExportBars: () => this.exportBarsCsv(),
@@ -738,6 +740,7 @@ export class ChartApp {
     if (!id) return;
     const meta = await api.instrument(id).catch(() => null);
     this.instrument = meta ?? stubInstrument(id);
+    this.status.setInstrumentVenue(this.instrument.venue);
     // The venue's own zone is only one option: the axis clock follows the timezone setting,
     // which defaults to UTC and offers the venue as `exchange`.
     this.local = new LocalTime(resolveZone(this.state.settings, this.instrument.session.timezone));
@@ -1234,7 +1237,7 @@ export class ChartApp {
         // on the chart itself.
         const feedWide = message.instrument === null;
         const onScreen = !feedWide && message.instrument === this.instrument?.id;
-        if (feedWide) this.status.setServerState(message.state, message.detail);
+        if (feedWide) this.status.setServerState(message.venue, message.state, message.detail);
         if (message.state === 'failed') {
           this.status.setError(message.detail || `${feedWide ? 'venue' : message.instrument} feed failed`);
         } else if (message.state === 'stalled' && (feedWide || onScreen)) {

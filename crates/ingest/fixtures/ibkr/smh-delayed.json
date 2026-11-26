@@ -1,0 +1,11 @@
+{
+  "_provenance": "synthesized: the transcribed smh shape with mktDataDelay 900, which is what a session without a streaming entitlement answers with",
+  "serverId": "smh265598",
+  "symbol": "AAPL",
+  "priceFactor": 100,
+  "mktDataDelay": 900,
+  "mdAvailability": "D",
+  "data": [{ "o": 182.0, "c": 183.5, "h": 184.2, "l": 181.5, "v": 95000, "t": 1699801200 }],
+  "points": 1,
+  "topic": "smh+265598"
+}

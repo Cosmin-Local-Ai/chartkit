@@ -142,4 +142,49 @@ export const api = {
     request(`/api/alerts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   clearAlertHistory: (): Promise<{ cleared: number }> => request(`/api/alerts`, { method: 'DELETE' }),
+
+  /** Every venue the server can route to, with its credential state. */
+  feeds: (): Promise<FeedReport> => request<FeedReport>('/api/feeds'),
+
+  /** Save the fields the trader typed. A key sent empty clears that field. */
+  saveFeeds: (venue: string, values: Record<string, string>): Promise<{ venues: FeedVenue[] }> =>
+    request('/api/feeds', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ venue, values }),
+    }),
 };
+
+/** One credential field a venue needs, as the server describes it. */
+export interface FeedField {
+  key: string;
+  /** Environment variable that overrides the stored value for this field. */
+  env: string;
+  label: string;
+  required: boolean;
+  /** Password box; the server never sends the value back. */
+  secret: boolean;
+  placeholder: string;
+}
+
+/** One venue in the feeds panel: whether it has credentials and what it is still waiting for. */
+export interface FeedVenue {
+  venue: string;
+  tag: string;
+  /** Name `chartkit --check-feed <slug>` takes. */
+  slug: string;
+  configured: boolean;
+  /** Labels of the required fields still missing. */
+  missing: string[];
+  /** Where the values that are set came from. */
+  source: 'environment' | 'file' | 'none';
+  fields: FeedField[];
+  /** Set values the server may show. Secrets never appear here. */
+  values: Record<string, string>;
+  note: string;
+}
+
+export interface FeedReport {
+  venues: FeedVenue[];
+  credentialFile: string;
+}

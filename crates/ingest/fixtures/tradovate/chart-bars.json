@@ -1,0 +1,36 @@
+{
+  "_provenance": "transcribed from https://api.tradovate.com/ section 'Get Chart' (data message); upTicks/downTicks are the documented bar fields",
+  "e": "chart",
+  "d": {
+    "charts": [
+      {
+        "id": 9,
+        "td": 20170413,
+        "bars": [
+          {
+            "timestamp": "2017-04-13T11:00:00.000Z",
+            "open": 2334.25,
+            "high": 2334.5,
+            "low": 2333,
+            "close": 2333.75,
+            "upVolume": 4712.234,
+            "downVolume": 201.124,
+            "upTicks": 1333,
+            "downTicks": 82
+          },
+          {
+            "timestamp": "2017-04-13T11:01:00.000Z",
+            "open": 2333.75,
+            "high": 2334.0,
+            "low": 2333.5,
+            "close": 2333.9,
+            "upVolume": 120.5,
+            "downVolume": 80.25,
+            "upTicks": 40,
+            "downTicks": 22
+          }
+        ]
+      }
+    ]
+  }
+}

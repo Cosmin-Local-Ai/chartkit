@@ -1,0 +1,17 @@
+{
+  "_provenance": "synthesized from the /tickle example on https://www.interactivebrokers.com/docs/web-api/ws/connection-guide.md",
+  "session": "d21b8cf5ebc8ea01c6ce37c8125ec83f",
+  "ssoExpires": 1700000000,
+  "userId": 12345,
+  "hmds": { "error": "no bridge" },
+  "iserver": {
+    "authStatus": {
+      "authenticated": true,
+      "competing": false,
+      "connected": true,
+      "message": "",
+      "MAC": "MAC",
+      "serverInfo": { "serverName": "hlyw", "serverVersion": "10.37.1" }
+    }
+  }
+}

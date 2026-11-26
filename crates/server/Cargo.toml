@@ -20,3 +20,8 @@ futures-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+
+[dev-dependencies]
+# The fake venue that replays captured frames is a real web socket server; the client
+# side is already a dependency, so this adds no new crate to the build.
+tokio-tungstenite.workspace = true

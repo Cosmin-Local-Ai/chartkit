@@ -45,8 +45,11 @@ pub fn spawn_pump(
             }
             alerts.on_event(&event);
             if let Ok(text) = serde_json::to_string(&event) {
-                if let FeedEvent::Status { instrument, .. } = &event {
-                    hub.remember_status(instrument.as_deref().unwrap_or("feed"), text.clone());
+                if let FeedEvent::Status { .. } = &event {
+                    // Feed-wide statuses are keyed by venue, so two venues streaming at
+                    // once cannot overwrite each other in the replay a new socket gets.
+                    let key = event.status_key().unwrap_or_else(|| "feed".to_string());
+                    hub.remember_status(&key, text.clone());
                 }
                 hub.send(text);
             }
@@ -58,9 +61,26 @@ pub fn spawn_pump(
 #[serde(tag = "type", rename_all = "camelCase")]
 enum ClientMessage {
     #[serde(rename_all = "camelCase")]
-    Subscribe { symbol: String, timeframe: String },
+    Subscribe {
+        symbol: String,
+        timeframe: String,
+        /// Which venue publishes this symbol. Absent means Binance, which is what every
+        /// client written before the other adapters spoke.
+        #[serde(default)]
+        venue: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
-    Unsubscribe { symbol: String },
+    Unsubscribe {
+        symbol: String,
+        #[serde(default)]
+        venue: Option<String>,
+    },
+}
+
+/// The venue a client named, defaulting to Binance for a client that names none.
+fn venue_of(text: Option<&str>) -> chartkit_core::Venue {
+    text.and_then(chartkit_ingest::credentials::venue_from_slug)
+        .unwrap_or(chartkit_core::Venue::Binance)
 }
 
 pub async fn upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
@@ -90,16 +110,21 @@ async fn session(mut socket: WebSocket, state: AppState) {
             inbound = socket.recv() => match inbound {
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<ClientMessage>(text.as_str()) {
-                        Ok(ClientMessage::Subscribe { symbol, timeframe }) => {
+                        Ok(ClientMessage::Subscribe { symbol, timeframe, venue }) => {
                             match timeframe.parse::<Timeframe>() {
-                                Ok(tf) => {
-                                    let _ = state.cmd_tx.send(FeedCommand::Subscribe { symbol, timeframe: tf });
-                                }
+                                Ok(tf) => state.feeds.send(FeedCommand::Subscribe {
+                                    venue: venue_of(venue.as_deref()),
+                                    symbol,
+                                    timeframe: tf,
+                                }),
                                 Err(error) => tracing::warn!("bad timeframe: {error}"),
                             }
                         }
-                        Ok(ClientMessage::Unsubscribe { symbol }) => {
-                            let _ = state.cmd_tx.send(FeedCommand::Unsubscribe { symbol });
+                        Ok(ClientMessage::Unsubscribe { symbol, venue }) => {
+                            state.feeds.send(FeedCommand::Unsubscribe {
+                                venue: venue_of(venue.as_deref()),
+                                symbol,
+                            });
                         }
                         Err(error) => tracing::warn!("bad client message: {error}"),
                     }

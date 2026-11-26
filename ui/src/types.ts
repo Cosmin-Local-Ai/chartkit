@@ -108,7 +108,14 @@ export interface InstrumentSummary {
   items: Instrument[];
 }
 
-export type FeedState = 'connecting' | 'backfilling' | 'live' | 'stalled' | 'failed';
+export type FeedState =
+  | 'connecting'
+  | 'backfilling'
+  | 'live'
+  | 'delayed'
+  | 'stalled'
+  | 'failed'
+  | 'not-configured';
 
 /**
  * What a server-side rule watches. `price-*` rules are settled by each live print,
@@ -165,7 +172,7 @@ export type LiveMessage =
   | { type: 'trades'; instrument: string; trades: Trade[] }
   | { type: 'bar'; instrument: string; timeframe: string; bar: Bar }
   | { type: 'depth'; instrument: string; snapshot: DepthSnapshot }
-  | { type: 'status'; instrument: string | null; state: FeedState; detail: string }
+  | { type: 'status'; instrument: string | null; venue: string; state: FeedState; detail: string }
   | { type: 'instruments'; venue: string; items: Instrument[] }
   // A rule the server judged. Flat, so it reads like every other event on the socket.
   | ({ type: 'alert' } & AlertFire);

@@ -1724,3 +1724,14 @@ input {
   color: var(--live);
   border-color: var(--live);
 }
+.set-feeds{flex-direction:column;grid-column:1/-1;gap:8px;padding:4px 12px 8px;display:flex}
+.feed-venue{border-top:1px solid var(--border);flex-direction:column;gap:6px;padding:10px 0;display:flex}
+.feed-head{align-items:baseline;gap:8px;display:flex}
+.feed-name{font-family:var(--mono);font-weight:600}
+.feed-state{color:var(--muted);font-size:11px}
+.feed-state[data-state=ok]{color:var(--up)}
+.feed-state[data-state=missing]{color:var(--live)}
+.feed-fields{grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;display:grid}
+.feed-check{color:var(--muted);font-family:var(--mono);font-size:11px}
+.st-server[data-phase=delayed]{color:var(--live)}
+.st-server[data-phase=idle]{color:var(--muted)}

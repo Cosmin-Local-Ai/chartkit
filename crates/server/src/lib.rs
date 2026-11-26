@@ -6,6 +6,7 @@
 
 pub mod alerts;
 pub mod api;
+pub mod feeds;
 pub mod live;
 pub mod prints;
 pub mod state;
@@ -15,7 +16,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chartkit_core::Timeframe;
+use chartkit_core::{Timeframe, Venue};
 use chartkit_ingest::{BinanceFeed, FeedCommand};
 use chartkit_store::Db;
 use state::{AppState, Hub};
@@ -76,6 +77,16 @@ pub async fn start(config: Config) -> Result<Running, BoxError> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let hub = Hub::default();
+    // One router in front of every venue feed. Binance registers its channel below; the
+    // other venues start when their credentials are present and answer `not-configured`
+    // when they are not.
+    let feeds = Arc::new(feeds::Feeds::new(
+        &config.data_dir,
+        event_tx.clone(),
+        timeframes.clone(),
+        hub.clone(),
+    ));
+    feeds.register(Venue::Binance, cmd_tx.clone());
     // Rules are read, and the gap since the last run is judged, before the feed can reach
     // the pump: otherwise a live print would be judged against rules that were never read.
     let alerts = alerts::AlertEngine::new(Arc::clone(&db), hub.clone());
@@ -83,6 +94,7 @@ pub async fn start(config: Config) -> Result<Running, BoxError> {
     let state = AppState {
         db: Arc::clone(&db),
         cmd_tx: cmd_tx.clone(),
+        feeds: Arc::clone(&feeds),
         hub: hub.clone(),
         rest: BinanceFeed::new(Vec::new()),
         prints: PrintBackfill::new(Arc::clone(&db), BinanceFeed::new(Vec::new())),
@@ -91,6 +103,11 @@ pub async fn start(config: Config) -> Result<Running, BoxError> {
     };
 
     live::spawn_pump(Arc::clone(&db), hub.clone(), Arc::clone(&alerts), event_rx);
+    // Publish each venue's state before the first client connects, so the strip reads
+    // "not configured" rather than showing nothing at all.
+    for venue in chartkit_ingest::credentials::ROUTED {
+        feeds.ensure_running(venue);
+    }
     let feed_timeframes = timeframes.clone();
     tokio::spawn(async move {
         if let Err(error) = BinanceFeed::new(feed_timeframes).run(cmd_rx, event_tx).await {
@@ -118,6 +135,7 @@ pub async fn start(config: Config) -> Result<Running, BoxError> {
             let Some(boot_timeframe) = timeframes.first().copied() else { return };
             for symbol in boot_symbols {
                 let _ = state.cmd_tx.send(FeedCommand::Subscribe {
+                    venue: Venue::Binance,
                     symbol: symbol.clone(),
                     timeframe: boot_timeframe,
                 });
@@ -134,6 +152,7 @@ pub async fn start(config: Config) -> Result<Running, BoxError> {
         .route("/api/health", axum::routing::get(api::health))
         .route("/api/coverage", axum::routing::get(api::coverage))
         .route("/api/instruments", axum::routing::get(api::instruments))
+        .route("/api/feeds", axum::routing::get(api::feeds).post(api::save_feeds))
         .route("/api/bars", axum::routing::get(api::bars))
         .route("/api/trades", axum::routing::get(api::trades))
         .route("/api/footprint", axum::routing::get(api::footprint))

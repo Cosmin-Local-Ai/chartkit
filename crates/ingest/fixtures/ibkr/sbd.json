@@ -1,0 +1,10 @@
+{
+  "_provenance": "synthesized from the row properties on https://www.interactivebrokers.com/docs/web-api/ws/booktrader.md; row 4 uses the 'size @ price' form that page warns about",
+  "topic": "sbd+U1234567+265598",
+  "data": [
+    { "row": 1, "price": "182.28", "bid": "300", "ask": "0" },
+    { "row": 2, "focus": 1, "price": "182.30", "bid": "0", "ask": "0" },
+    { "row": 3, "price": "182.32", "bid": "0", "ask": "200" },
+    { "row": 4, "price": "50 @ 182.36", "bid": "0", "ask": "50" }
+  ]
+}

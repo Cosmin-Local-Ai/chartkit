@@ -1,0 +1,23 @@
+{
+  "_provenance": "transcribed from https://api.tradovate.com/ section 'Handling Market Data' / 'Subscribe Quote'",
+  "e": "md",
+  "d": {
+    "quotes": [
+      {
+        "timestamp": "2021-04-13T04:59:06.588Z",
+        "contractId": 123456,
+        "entries": {
+          "Bid": { "price": 18405.123, "size": 7.123 },
+          "TotalTradeVolume": { "size": 4118.123 },
+          "Offer": { "price": 18410.012, "size": 12.35 },
+          "LowPrice": { "price": 18355.23 },
+          "Trade": { "price": 18405.023, "size": 2.1 },
+          "OpenInterest": { "size": 40702.024 },
+          "OpeningPrice": { "price": 18515.123 },
+          "HighPrice": { "price": 18520.125 },
+          "SettlementPrice": { "price": 18520.257 }
+        }
+      }
+    ]
+  }
+}

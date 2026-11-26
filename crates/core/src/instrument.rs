@@ -29,6 +29,10 @@ pub enum Venue {
     Coinbase,
     Tradovate,
     InteractiveBrokers,
+    /// Rithmic R|Trade Execution Platform: a direct CME book rather than a broker
+    /// round-trip. Tradovate's own feed is Rithmic-backed, so this is a second path
+    /// to the same market, not a new one.
+    Rithmic,
     Simulation,
 }
 
@@ -98,6 +102,7 @@ impl VenueTag for Venue {
             Venue::Coinbase => "COINBASE",
             Venue::Tradovate => "TRADOVATE",
             Venue::InteractiveBrokers => "IBKR",
+            Venue::Rithmic => "RITHMIC",
             Venue::Simulation => "SIM",
         }
     }

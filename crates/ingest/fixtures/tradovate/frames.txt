@@ -1,0 +1,7 @@
+# Transcribed from https://api.tradovate.com/ section "Server Frames".
+# A frame is one type character followed by JSON. Lines below are raw frames, one per line.
+o
+h
+a[{"s":200,"i":2}]
+a[{"e":"props","d":{"entityType":"order","eventType":"Created","entity":{"id":210518,"accountId":25,"contractId":560901,"timestamp":"2016-11-04T00:02:36.626Z","action":"Sell","ordStatus":"PendingNew","admin":false}}}]
+c[3000,"Go away!"]

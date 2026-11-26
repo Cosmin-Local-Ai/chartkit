@@ -3,6 +3,30 @@ import type { ConnectionPhase, LatencySample } from './live';
 import { el } from './canvasKit';
 import { fmtAge, fmtCompact } from './format';
 
+/** How each venue report reads in the strip, and how it is coloured. */
+const WORDS: Record<string, string> = {
+  connecting: 'connecting',
+  backfilling: 'filling history',
+  live: 'live',
+  delayed: 'delayed data',
+  stalled: 'stalled',
+  failed: 'failed',
+  'not-configured': 'not configured',
+};
+const PHASES: Record<string, string> = {
+  live: 'open',
+  delayed: 'delayed',
+  failed: 'error',
+  stalled: 'error',
+  'not-configured': 'idle',
+};
+
+function lastOf(map: Map<string, { state: string; detail: string }>): { state: string; detail: string } | null {
+  let found: { state: string; detail: string } | null = null;
+  for (const value of map.values()) found = value;
+  return found;
+}
+
 export interface SeriesStatus {
   loaded: number;
   /** Bars the view actually shows: loaded history is usually wider than the plot. */
@@ -28,8 +52,9 @@ export class StatusStrip {
   private series: SeriesStatus = { loaded: 0, visible: 0, loadingOlder: false, olderExhausted: false };
   private feedPhase: ConnectionPhase = 'idle';
   private feedDetail = '';
-  private serverState = '';
-  private serverDetail = '';
+  /** Feed health per venue: several feeds run at once, and only one is on screen. */
+  private venues = new Map<string, { state: string; detail: string }>();
+  private venue: string | null = null;
   private lastBeat = 0;
   private showLatency = true;
   private latencySample: LatencySample | null = null;
@@ -50,9 +75,15 @@ export class StatusStrip {
     this.render();
   }
 
-  setServerState(state: string, detail: string): void {
-    this.serverState = state;
-    this.serverDetail = detail;
+  /** Records what one venue last reported. The strip shows the venue on screen. */
+  setServerState(venue: string, state: string, detail: string): void {
+    this.venues.set(venue, { state, detail });
+    this.render();
+  }
+
+  /** Points the venue chip at the instrument the chart is showing. */
+  setInstrumentVenue(venue: string | null): void {
+    this.venue = venue;
     this.render();
   }
 
@@ -91,10 +122,15 @@ export class StatusStrip {
       .filter(Boolean)
       .join(' · ');
 
-    this.server.hidden = this.serverState === '';
-    this.server.dataset.phase = this.serverState === 'live' ? 'open' : this.serverState === 'failed' ? 'error' : 'connecting';
-    this.server.textContent = `venue ${this.serverState || 'unknown'}`;
-    this.server.title = this.serverDetail;
+    // The venue the chart belongs to is the one worth showing; before that settles, the
+    // last venue to speak is the best answer available.
+    const shown = this.venues.get(this.venue ?? '') ?? lastOf(this.venues);
+    this.server.hidden = shown === null;
+    if (shown) {
+      this.server.dataset.phase = PHASES[shown.state] ?? 'connecting';
+      this.server.textContent = `${this.venue ?? 'venue'} ${WORDS[shown.state] ?? shown.state}`;
+      this.server.title = shown.detail;
+    }
 
     this.latency.hidden = !this.showLatency;
     if (this.showLatency) {

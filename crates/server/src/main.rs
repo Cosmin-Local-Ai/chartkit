@@ -26,6 +26,17 @@ struct Cli {
     /// Directory holding the built web client.
     #[arg(long, default_value = "ui/dist")]
     ui_dir: String,
+    /// Probe one venue with the credentials on this machine and print what actually came
+    /// back: entitlement, first sequence number, counts, latency. Exits cleanly with
+    /// "not configured" when the venue has no credentials, so it is safe to run blind.
+    #[arg(long, value_name = "VENUE")]
+    check_feed: Option<String>,
+    /// Symbol the feed check subscribes to. Defaults to one each venue is known for.
+    #[arg(long, default_value = "")]
+    check_symbol: String,
+    /// Seconds the feed check watches the wire.
+    #[arg(long, default_value_t = 15)]
+    check_seconds: u64,
 }
 
 #[tokio::main]
@@ -34,6 +45,9 @@ async fn main() -> Result<(), chartkit_server::BoxError> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
+    if let Some(text) = cli.check_feed.as_deref() {
+        return run_check(&cli, text).await;
+    }
     let timeframes: Vec<Timeframe> = cli
         .timeframes
         .iter()
@@ -51,6 +65,45 @@ async fn main() -> Result<(), chartkit_server::BoxError> {
     .await?;
 
     running.wait().await
+}
+
+/// `--check-feed <venue>`: prove a venue from this machine, without anyone else seeing
+/// the credentials. No server, no database, no writes.
+async fn run_check(cli: &Cli, text: &str) -> Result<(), chartkit_server::BoxError> {
+    use chartkit_core::instrument::VenueTag;
+    use chartkit_core::Venue;
+    use chartkit_ingest::credentials::{venue_from_slug, CredentialStore};
+    let Some(venue) = venue_from_slug(text) else {
+        println!("unknown venue {text:?}; try tradovate, ibkr, rithmic or binance");
+        return Ok(());
+    };
+    let store = CredentialStore::load(&resolve_data_dir(&cli.data_dir)?);
+    let symbol = if !cli.check_symbol.is_empty() {
+        cli.check_symbol.clone()
+    } else {
+        match venue {
+            Venue::Tradovate | Venue::Rithmic => "MES".to_string(),
+            Venue::InteractiveBrokers => "AAPL@265598".to_string(),
+            Venue::Binance => "BTCUSDT".to_string(),
+            _ => return Ok(()),
+        }
+    };
+    let timeframe = cli
+        .timeframes
+        .first()
+        .map(|text| text.parse::<Timeframe>())
+        .transpose()?
+        .unwrap_or(Timeframe::Minute(1));
+    match chartkit_server::feeds::probe(venue, &store, &symbol, timeframe, cli.check_seconds).await {
+        Ok(report) => {
+            chartkit_server::feeds::print_probe(&report);
+            Ok(())
+        }
+        Err(reason) => {
+            println!("{}: not configured — {reason}", venue.tag().to_lowercase());
+            Ok(())
+        }
+    }
 }
 
 fn resolve_data_dir(raw: &str) -> Result<PathBuf, std::io::Error> {

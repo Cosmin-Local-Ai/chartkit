@@ -447,7 +447,7 @@ impl BinanceFeed {
                 "{WS_BASE}?streams={}",
                 streams.keys().cloned().collect::<Vec<_>>().join("/")
             );
-            let _ = tx.send(FeedEvent::status(None, FeedState::Connecting, "connecting"));
+            let _ = tx.send(FeedEvent::venue_status(Venue::Binance, FeedState::Connecting, "connecting"));
             match connect_async(&url).await {
                 Ok((socket, _)) => {
                     backoff = Duration::from_millis(500);
@@ -487,7 +487,7 @@ impl BinanceFeed {
                                         last_frame = tokio::time::Instant::now();
                                         if !reported_live {
                                             reported_live = true;
-                                            let _ = tx.send(FeedEvent::status(None, FeedState::Live, "streaming"));
+                                            let _ = tx.send(FeedEvent::venue_status(Venue::Binance, FeedState::Live, "streaming"));
                                         }
                                     }
                                     Ok(Message::Close(_)) | Err(_) => break 'socket,
@@ -499,7 +499,7 @@ impl BinanceFeed {
                             _ = watchdog.tick() => {
                                 if reported_live && last_frame.elapsed() >= IDLE_AFTER {
                                     reported_live = false;
-                                    let _ = tx.send(FeedEvent::status(None, FeedState::Stalled, "no frames for 15s"));
+                                    let _ = tx.send(FeedEvent::venue_status(Venue::Binance, FeedState::Stalled, "no frames for 15s"));
                                 }
                             }
                         }
@@ -507,7 +507,7 @@ impl BinanceFeed {
                 }
                 Err(error) => {
                     tracing::warn!("binance connect failed: {error}");
-                    let _ = tx.send(FeedEvent::status(None, FeedState::Failed, error.to_string()));
+                    let _ = tx.send(FeedEvent::venue_status(Venue::Binance, FeedState::Failed, error.to_string()));
                 }
             }
             tokio::time::sleep(backoff).await;
@@ -566,7 +566,7 @@ fn apply_command(
     timeframes: &[Timeframe],
 ) -> Vec<String> {
     match command {
-        FeedCommand::Subscribe { symbol, timeframe } => {
+        FeedCommand::Subscribe { symbol, timeframe, .. } => {
             let lower = symbol.to_ascii_lowercase();
             let mut wanted: Vec<String> = vec![format!("{lower}@trade"), format!("{lower}@depth@100ms")];
             let mut intervals: Vec<String> = timeframes.iter().filter_map(|tf| interval(*tf).ok()).collect();
@@ -587,7 +587,7 @@ fn apply_command(
             }
             added
         }
-        FeedCommand::Unsubscribe { symbol } => {
+        FeedCommand::Unsubscribe { symbol, .. } => {
             let stale: Vec<String> = streams
                 .iter()
                 .filter(|(_, owner)| *owner == symbol)
@@ -761,12 +761,22 @@ mod tests {
         assert_eq!(clamp_agg_limit(0), 1);
     }
 
+    /// The command the server sends for a Binance symbol, as the router now tags every
+    /// subscription with its venue.
+    fn binance_subscribe() -> FeedCommand {
+        FeedCommand::Subscribe {
+            venue: Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            timeframe: Timeframe::Minute(1),
+        }
+    }
+
     #[test]
     fn subscribe_adds_trade_depth_and_kline_streams() {
         let mut streams = HashMap::new();
         let added = apply_command(
             &mut streams,
-            &FeedCommand::Subscribe { symbol: "BTCUSDT".into(), timeframe: Timeframe::Minute(1) },
+            &binance_subscribe(),
             &[Timeframe::Minute(5)],
         );
         assert!(added.contains(&"btcusdt@trade".to_string()));
@@ -775,7 +785,7 @@ mod tests {
         assert!(added.contains(&"btcusdt@kline_1m".to_string()));
         let again = apply_command(
             &mut streams,
-            &FeedCommand::Subscribe { symbol: "BTCUSDT".into(), timeframe: Timeframe::Minute(1) },
+            &binance_subscribe(),
             &[Timeframe::Minute(5)],
         );
         assert!(again.is_empty());

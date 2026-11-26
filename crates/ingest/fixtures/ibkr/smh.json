@@ -1,0 +1,26 @@
+{
+  "_provenance": "transcribed from https://www.interactivebrokers.com/docs/web-api/ws/historical-data.md response example; priceFactor 100 means values are in pennies",
+  "serverId": "smh265598",
+  "symbol": "AAPL",
+  "text": "APPLE INC",
+  "priceFactor": 100,
+  "startTime": "1699797600",
+  "high": "185.00/1250000/0",
+  "low": "180.00/800000/0",
+  "timePeriod": "1d",
+  "barLength": 3600,
+  "mdAvailability": "S",
+  "mktDataDelay": 0,
+  "outsideRth": false,
+  "volumeFactor": 1,
+  "priceDisplayRule": 0,
+  "priceDisplayValue": "2",
+  "negativeCapable": false,
+  "messageVersion": 2,
+  "data": [
+    { "o": 182.0, "c": 183.5, "h": 184.2, "l": 181.5, "v": 95000, "t": 1699801200 },
+    { "o": 183.5, "c": 182.8, "h": 185.0, "l": 182.0, "v": 110000, "t": 1699804800 }
+  ],
+  "points": 2,
+  "topic": "smh+265598"
+}

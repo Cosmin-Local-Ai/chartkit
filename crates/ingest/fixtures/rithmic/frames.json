@@ -1,0 +1,9 @@
+{
+  "_provenance": "synthesized: hex-encoded R|Protocol frames (4-byte big-endian body length, then protobuf), encoded from the message shapes in the third-party .proto transcription at https://github.com/parbhatc/Rithmic/tree/main/proto. Rithmic's own schema is not published, so no Rithmic example message is quoted here. Regenerate with: cargo test -p chartkit-ingest emit_fixtures -- --ignored",
+  "response-login": "0000001a98b64b0bf2e9400130a2f54a02753189824b0000000000003e40",
+  "last-trade-1": "0000003498b64b9601a2e135034d4553aae13503434d45b1ea300000000040edb34090f5300398d83601a0a54980e2cfaa06a8a54990a10f",
+  "last-trade-2": "0000003498b64b9601a2e135034d4553aae13503434d45b1ea300000000000edb34090f5300198d83602a0a54981e2cfaa06a8a54980b518",
+  "last-trade-3": "0000003498b64b9601a2e135034d4553aae13503434d45b1ea300000000080edb34090f5300798d83601a0a54982e2cfaa06a8a549a0f736",
+  "order-book": "0000005d98b64b9c01a2e135034d4553aae13503434d45c0fa4c06d2aa4b1000000000c0ecb3400000000080ecb340e2aa4b100000000000edb3400000000040edb340d8aa4b0cd8aa4b1ee8aa4b08e8aa4b13a0a54982e2cfaa06a8a549a0c21e",
+  "order-book-begin-only": "0000002798b64b9c01a2e135034d4553aae13503434d45c0fa4c04e2aa4b080000000000edb340e8aa4b08"
+}

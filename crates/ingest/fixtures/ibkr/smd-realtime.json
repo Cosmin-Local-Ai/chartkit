@@ -1,0 +1,13 @@
+{
+  "_provenance": "transcribed from https://www.interactivebrokers.com/docs/web-api/ws/streaming-data.md response example; 6509 'RB' = RealTime + Snapshot + Book",
+  "server_id": "smd265598",
+  "conidEx": "265598",
+  "conid": 265598,
+  "_updated": 1699885800500,
+  "6119": "smd265598",
+  "31": "182.50",
+  "84": "182.48",
+  "86": "182.52",
+  "6509": "RB",
+  "topic": "smd+265598"
+}

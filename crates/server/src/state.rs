@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chartkit_ingest::{BinanceFeed, FeedCommand};
+use crate::feeds::Feeds;
 use chartkit_store::Db;
 use tokio::sync::{broadcast, mpsc};
 
@@ -72,6 +73,9 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub cmd_tx: mpsc::UnboundedSender<FeedCommand>,
     pub hub: Hub,
+    /// One command channel per venue, in front of `cmd_tx`. A subscription names the
+    /// venue it belongs to, so per-instrument feed selection is a routing decision.
+    pub feeds: Arc<Feeds>,
     /// REST-only handle for instrument lists and candle backfill.
     pub rest: BinanceFeed,
     /// Pulls prints the live stream never saw into the store, on demand and at boot.

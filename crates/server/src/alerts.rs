@@ -356,7 +356,12 @@ mod tests {
         assert_eq!(hub.alert_snapshot().len(), 2);
         // The other half of the stream is left alone: a depth or status event cannot fire
         // a price rule.
-        engine.on_event(&FeedEvent::Status { instrument: None, state: FeedState::Live, detail: String::new() });
+        engine.on_event(&FeedEvent::Status {
+            venue: chartkit_core::Venue::Binance,
+            instrument: None,
+            state: FeedState::Live,
+            detail: String::new(),
+        });
         assert!(drained(&mut events).is_empty());
     }
 

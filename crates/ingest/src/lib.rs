@@ -1,10 +1,25 @@
 //! Venue feeds: one adapter per exchange behind a shared event and command type.
+//!
+//! Binance, Tradovate, IBKR and Rithmic each emit the same [`FeedEvent`]s and accept the same
+//! [`FeedCommand`]s, so the server pumps any of them into the same store and hub. Logins come
+//! from the environment or a file the settings panel writes — never from the binary — and a
+//! venue with no credentials says so rather than failing or looking live. See
+//! [`credentials`] for what each venue needs and `chartkit --check-feed <venue>` to prove one
+//! against the real venue with the user's own subscription.
 
 pub mod binance;
+pub mod credentials;
 pub mod event;
+pub mod ibkr;
+pub mod rithmic;
+pub mod tradovate;
 
 pub use binance::{AggTrade, AggTradePage, BinanceFeed, REST_BASE};
+pub use credentials::{CredentialStore, VenueStatus};
 pub use event::{FeedCommand, FeedEvent, FeedState};
+pub use ibkr::{Entitlement, IbkrConfig, IbkrFeed};
+pub use rithmic::{RithmicConfig, RithmicFeed};
+pub use tradovate::{TradovateConfig, TradovateFeed};
 
 use serde::{Deserialize, Serialize};
 

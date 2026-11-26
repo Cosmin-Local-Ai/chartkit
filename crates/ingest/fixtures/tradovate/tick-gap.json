@@ -1,0 +1,36 @@
+{
+  "_provenance": "synthesized: the transcribed tick packet with ids 11768401, 11768402, then 11768407, so 11768403..6 were never delivered. The docs define the tick id but show no gap example. The 'Data stream messages' section shows this object on its own; the 'Get Chart' section shows the same payload inside the {e:chart,d:{charts:[...]}} envelope, which is what the socket actually sends.",
+  "e": "chart",
+  "d": {
+    "charts": [
+      {
+        "id": 16335,
+        "s": "db",
+        "td": 20210718,
+        "bp": 11917,
+        "bt": 1563421179735,
+        "ts": 0.25,
+        "tks": [
+          {
+            "t": 0,
+            "p": 0,
+            "s": 3,
+            "id": 11768401
+          },
+          {
+            "t": 1500,
+            "p": 4,
+            "s": 1,
+            "id": 11768402
+          },
+          {
+            "t": 9000,
+            "p": 6,
+            "s": 2,
+            "id": 11768407
+          }
+        ]
+      }
+    ]
+  }
+}

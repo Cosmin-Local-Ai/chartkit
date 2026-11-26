@@ -1483,6 +1483,7 @@ fn venue_tag(venue: Venue) -> String {
         Venue::Coinbase => "COINBASE",
         Venue::Tradovate => "TRADOVATE",
         Venue::InteractiveBrokers => "IBKR",
+        Venue::Rithmic => "RITHMIC",
         Venue::Simulation => "SIM",
     }
     .to_string()
@@ -1496,6 +1497,7 @@ fn venue_from_tag(tag: String) -> Venue {
         "COINBASE" => Venue::Coinbase,
         "TRADOVATE" => Venue::Tradovate,
         "IBKR" => Venue::InteractiveBrokers,
+        "RITHMIC" => Venue::Rithmic,
         "SIM" => Venue::Simulation,
         _ => Venue::Binance,
     }
