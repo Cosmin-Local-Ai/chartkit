@@ -4,5 +4,5 @@ mod db;
 
 pub use db::{
     BackfillPage, BarFilter, ClusterBarRow, Db, PrintCoverage, PrintSource, PrintSpan,
-    SizeBandRow, StoreError, Workspace,
+    SizeBandRow, StoreError, TpoCellRow, Workspace,
 };

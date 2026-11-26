@@ -1,5 +1,6 @@
 import { api } from './api';
 import { DEFAULT_FOOTPRINT_SETTINGS, normaliseFootprintSettings, type FootprintSettings } from './footprintSettings';
+import { DEFAULT_TPO_SETTINGS, normaliseTpoSettings, type TpoSettings } from './tpoSettings';
 import { normaliseInstances, type IndicatorInstance } from './indicators/engine';
 import { normaliseDrawings, type DrawingInstance } from './drawings/engine';
 import { SERIES_STYLES, type SeriesStyle } from './panes/pricePane';
@@ -34,6 +35,8 @@ export interface WorkspaceState {
   recentTools: string[];
   /** Footprint pane settings; field names follow the shipped product's own. */
   footprint: FootprintSettings;
+  /** TPO / market-profile pane settings, including the grid its letters are cut on. */
+  tpo: TpoSettings;
   /** Appearance, chart data, timezone and latency settings from the settings dialog. */
   settings: ChartSettings;
   /** Named view presets the settings dialog saves and applies. */
@@ -67,8 +70,10 @@ export const DEFAULT_STATE: WorkspaceState = {
   watchlist: [],
   // The size-band grid starts switched off: it is an extra way to read the same prints, and
   // a workspace that has never asked for it should not pay a window scan for it.
-  panes: { volume: true, footprint: true, profile: true, sizeBands: false, ladder: true, sidebar: true },
-  weights: { price: 3.2, volume: 1, footprint: 1.6, profile: 1.2, sizeBands: 1.1 },
+  // The TPO grid starts off for the same reason the size-band grid does: it is another read
+  // on the same prints, and a workspace that never asked for it should not pay a window scan.
+  panes: { volume: true, footprint: true, profile: true, sizeBands: false, tpo: false, ladder: true, sidebar: true },
+  weights: { price: 3.2, volume: 1, footprint: 1.6, profile: 1.2, sizeBands: 1.1, tpo: 1.15 },
   weightsCustomized: false,
   // No barStep: a workspace that has never saved a zoom gets one from the view's density
   // target, which needs the plot width and so can only be worked out on the first frame.
@@ -77,6 +82,7 @@ export const DEFAULT_STATE: WorkspaceState = {
   drawings: [],
   recentTools: [],
   footprint: structuredClone(DEFAULT_FOOTPRINT_SETTINGS),
+  tpo: structuredClone(DEFAULT_TPO_SETTINGS),
   settings: { ...DEFAULT_SETTINGS },
   templates: [],
 };
@@ -142,6 +148,7 @@ export function normaliseState(raw: unknown): WorkspaceState | null {
     drawings: normaliseDrawings(value.drawings),
     recentTools: Array.isArray(value.recentTools) ? value.recentTools.filter((id) => typeof id === 'string') : [],
     footprint: normaliseFootprintSettings(value.footprint),
+    tpo: normaliseTpoSettings(value.tpo),
     settings: normaliseSettings(value.settings),
     templates: normaliseTemplates(value.templates),
   };

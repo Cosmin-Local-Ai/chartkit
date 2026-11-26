@@ -7,7 +7,8 @@ use axum::Json;
 use chartkit_core::{
     new_id, Alert, AlertKind, AssetClass, ClusterBar, ClusterPrint, ClusterSearch, FootprintSeries,
     FootprintSeriesBuilder, SizeBand, SizeBandBar, SizeBandCell, SizeBandLevel, SizeBandSeries,
-    SizeUnit, Timeframe, Trade, VolumeProfile, VolumeProfileBuilder,
+    SizeUnit, Timeframe, TpoBuilder, TpoCell, TpoGrid, TpoSeries, Trade, ValueAreaBasis,
+    VolumeProfile, VolumeProfileBuilder,
 };
 use chartkit_ingest::credentials::venue_from_slug;
 use chartkit_store::{BarFilter, ClusterBarRow, SizeBandRow, StoreError};
@@ -348,6 +349,167 @@ pub async fn profile(
     .map_err(|e| ApiError::Task(e.to_string()))?
     .map_err(ApiError::from)?;
     Ok(Json(serde_json::to_value(profile)?))
+}
+
+// ---------------------------------------------------------------- TPO / market profile
+
+/// Time bucket the profile cuts the window into when the caller does not say. Thirty minutes
+/// is the shortest grid that still reads as letters on a screen and the one most market
+/// profiles ship with.
+const DEFAULT_TPO_BUCKET_MINUTES: i64 = 30;
+/// A session is a day unless the trader says otherwise: the venue this chart streams from
+/// trades around the clock, so UTC midnight is the only break its tape actually has.
+const DEFAULT_TPO_SESSION_MINUTES: i64 = 1_440;
+/// Buckets one answer carries, and the most any caller may ask for. The window is aggregated
+/// whole, then trimmed to the newest buckets, so a pan across a month costs one scan either
+/// way and only the rows that draw come back.
+const TPO_BUCKETS: i64 = 240;
+const TPO_BUCKETS_MAX: i64 = 2_000;
+
+#[derive(Deserialize)]
+pub struct TpoQuery {
+    pub instrument: String,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    /// Minutes in one time bucket. Deliberately not the chart interval: the letters are a
+    /// grid over time, and a trader comparing a 1m chart with a 1h chart of the same session
+    /// has to be reading the same grid in both.
+    #[serde(default)]
+    pub bucket: Option<i64>,
+    /// Minutes past UTC midnight at which a session begins.
+    #[serde(default, rename = "sessionStart")]
+    pub session_start: Option<i64>,
+    /// Minutes one session runs. Buckets must divide it exactly, so a letter never straddles
+    /// a session boundary.
+    #[serde(default, rename = "sessionLength")]
+    pub session_length: Option<i64>,
+    /// Fraction the value area must cover.
+    #[serde(default, rename = "valueArea")]
+    pub value_area: Option<f64>,
+    /// `volume` (default) or `tpo`: whether the value area follows the money or the clock.
+    #[serde(default, rename = "valueAreaFrom")]
+    pub value_area_from: Option<String>,
+    /// Price row width in venue ticks. Same meaning as on `/api/profile`.
+    #[serde(default, alias = "tickMultiplier")]
+    pub ticks: Option<i64>,
+    /// Price row width as a price; takes precedence over `ticks`.
+    #[serde(default)]
+    pub step: Option<f64>,
+    /// Buckets to return; the newest ones survive the trim.
+    pub limit: Option<i64>,
+}
+
+/// Which measure a value area was asked to cover.
+fn value_area_basis(spec: Option<&str>) -> Result<ValueAreaBasis, ApiError> {
+    match spec.filter(|b| !b.is_empty()) {
+        None | Some("volume") => Ok(ValueAreaBasis::Volume),
+        Some("tpo") => Ok(ValueAreaBasis::Tpo),
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "unknown value-area basis {other}; try volume or tpo"
+        ))),
+    }
+}
+
+/// The grid the letters are cut on, or the reason it cannot be cut.
+fn tpo_grid(
+    bucket: Option<i64>,
+    session_start: Option<i64>,
+    session_length: Option<i64>,
+) -> Result<TpoGrid, ApiError> {
+    let bucket = bucket.unwrap_or(DEFAULT_TPO_BUCKET_MINUTES);
+    let session_length = session_length.unwrap_or(DEFAULT_TPO_SESSION_MINUTES);
+    let session_start = session_start.unwrap_or(0);
+    TpoGrid::new(bucket, session_length, session_start).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "{bucket} minute buckets do not fit a {session_length} minute session starting at minute {session_start}: \
+             the bucket length must divide the session length, so no letter spans two sessions"
+        ))
+    })
+}
+
+/// Prints of a window cut into time buckets and price rows: the letter grid, with the point
+/// of control and value area of every session the window covers.
+///
+/// The grid is aggregated in SQL at the venue's own price tick, which is what lets a session
+/// answer with the same levels `/api/profile` answers for the same window, and is also what
+/// keeps the answer small: the ticks are folded to the caller's row width on the way out.
+pub async fn tpo(
+    State(state): State<AppState>,
+    Query(query): Query<TpoQuery>,
+) -> Result<Json<TpoSeries>, ApiError> {
+    let grid = tpo_grid(query.bucket, query.session_start, query.session_length)?;
+    let limit = query.limit.unwrap_or(TPO_BUCKETS).clamp(1, TPO_BUCKETS_MAX);
+    let value_area = query.value_area.unwrap_or(0.7).clamp(0.05, 1.0);
+    let basis = value_area_basis(query.value_area_from.as_deref())?;
+    let instrument = state
+        .db
+        .instrument(&query.instrument)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::NotFound(format!("no instrument {}", query.instrument)))?;
+    let price_tick = instrument.price_tick;
+    let step_ticks = profile_step_ticks(query.step, query.ticks, price_tick)?;
+    if let (Some(from), Some(to)) = (query.from, query.to) {
+        state.prints.request_covering(&instrument, from, to).await;
+    }
+
+    let state = state.clone();
+    let id = query.instrument.clone();
+    let (from, to) = (query.from, query.to);
+    let series = tokio::task::spawn_blocking(move || {
+        tpo_series(
+            &state.db,
+            &id,
+            from,
+            to,
+            grid,
+            price_tick,
+            step_ticks,
+            value_area,
+            basis,
+            limit as usize,
+            chartkit_core::now_ms(),
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Task(e.to_string()))?
+    .map_err(ApiError::from)?;
+    // Written straight to the response: an answer at the venue tick over a busy window runs to
+    // tens of megabytes, and a `serde_json::Value` copy of it costs several times that.
+    Ok(Json(series))
+}
+
+/// Aggregates one window into the letter grid. Split out from the handler so a test can run
+/// the same path against a store of its own.
+pub fn tpo_series(
+    db: &chartkit_store::Db,
+    instrument: &str,
+    from: Option<i64>,
+    to: Option<i64>,
+    grid: TpoGrid,
+    price_tick: f64,
+    step_ticks: i64,
+    value_area: f64,
+    basis: ValueAreaBasis,
+    limit: usize,
+    now: i64,
+) -> Result<TpoSeries, StoreError> {
+    // Streamed, not collected: the aggregation answers one cell at a time and the builder
+    // folds it in, so a window never exists twice in memory.
+    let mut builder = TpoBuilder::new(grid, price_tick, step_ticks);
+    db.tpo_cells_fold(instrument, from, to, grid.bucket_ms(), grid.session_offset_ms(), price_tick, |row| {
+        builder.on_cell(
+            row.bucket,
+            row.level,
+            &TpoCell {
+                buy_qty: row.buy_qty,
+                sell_qty: row.sell_qty,
+                buy_n: row.buy_n as u64,
+                sell_n: row.sell_n as u64,
+            },
+        );
+        Ok(())
+    })?;
+    Ok(builder.build(instrument, from, to, value_area, basis, limit, now))
 }
 
 // ---------------------------------------------------------------- size bands
@@ -1365,5 +1527,222 @@ mod tests {
         assert_eq!(size_unit(None).unwrap(), SizeUnit::Notional, "notional is the default in both endpoints");
         assert!(size_unit(Some("lots")).is_err());
         assert!(size_unit(Some("")).is_ok(), "an empty parameter is the same as none");
+    }
+
+    // ------------------------------------------------------------------ TPO / market profile
+
+    const ID: &str = "BINANCE:BTCUSDT";
+    const TICK: f64 = 0.5;
+    const MINUTE: i64 = 60_000;
+    const HOUR: i64 = 3_600_000;
+    const DAY: i64 = 86_400_000;
+    /// A UTC midnight, and a wall clock a few hours inside it, so "now" sits inside a session
+    /// the way it does on a live chart and a straddle test knows which day it is on.
+    const DAY0: i64 = 1_700_000_000_000 - 1_700_000_000_000 % DAY;
+    const NOW: i64 = DAY0 + 2 * HOUR;
+
+    /// Prints over three hours, seven minutes apart, on a grid of prices and dyadic
+    /// quantities, so the sums the aggregation answers with are exact.
+    fn profile_prints() -> Vec<Trade> {
+        let prices = [100.0, 100.5, 101.0, 104.5, 110.0];
+        let qtys = [0.25, 1.0, 4.0, 5.0];
+        let mut prints = Vec::new();
+        let mut seq = 1u64;
+        for index in 0..26i64 {
+            for (slot, price) in prices.iter().enumerate() {
+                prints.push(Trade {
+                    ts: NOW + index * 7 * MINUTE + slot as i64,
+                    seq,
+                    price: *price,
+                    qty: qtys[(index as usize + slot) % qtys.len()],
+                    aggressor: if (index + slot as i64) % 2 == 0 { Side::Buy } else { Side::Sell },
+                });
+                seq += 1;
+            }
+        }
+        prints
+    }
+
+    fn grid(db: &chartkit_store::Db, step_ticks: i64, basis: ValueAreaBasis) -> TpoSeries {
+        let grid = tpo_grid(Some(30), Some(0), Some(1_440)).expect("default grid");
+        tpo_series(db, ID, None, None, grid, TICK, step_ticks, 0.7, basis, 400, NOW).expect("tpo grid")
+    }
+
+    /// The check the whole pane rests on: every print of the window lands in exactly one cell
+    /// of exactly one bucket, counted once, against a plain scan of the prints the
+    /// `/api/trades` read returns.
+    #[test]
+    fn the_letter_grid_answers_the_same_cells_as_a_plain_scan_of_the_same_prints() {
+        let db = chartkit_store::Db::in_memory().expect("in-memory store");
+        let prints = profile_prints();
+        db.record_trades(ID, &prints).expect("prints");
+        let series = grid(&db, 1, ValueAreaBasis::Volume);
+
+        let scanned = db.trades(ID, None, None, 200_000).expect("the same window, printed");
+        assert_eq!(scanned.len(), prints.len(), "the plain read lost a print");
+        let mut want: std::collections::BTreeMap<(i64, i64), (f64, u64)> = std::collections::BTreeMap::new();
+        for print in &scanned {
+            let bucket = print.ts.div_euclid(30 * MINUTE) * 30 * MINUTE;
+            let level = chartkit_core::tick_index(print.price, TICK);
+            let cell = want.entry((bucket, level)).or_default();
+            cell.0 += print.qty;
+            cell.1 += 1;
+        }
+
+        let mut got: std::collections::BTreeMap<(i64, i64), (f64, u64)> = std::collections::BTreeMap::new();
+        for session in &series.sessions {
+            for bucket in &session.buckets {
+                assert_eq!(bucket.start % (30 * MINUTE), 0, "a bucket carries the start its letter came from");
+                for (price, cell) in &bucket.rows {
+                    let entry = got.entry((bucket.start, chartkit_core::tick_index(*price, TICK))).or_default();
+                    entry.0 += cell.total();
+                    entry.1 += cell.prints();
+                }
+            }
+        }
+        assert_eq!(got, want, "one (bucket, price) cell disagrees with the plain count");
+        assert_eq!(series.prints as usize, prints.len(), "no print was counted twice or dropped");
+        let want_qty: f64 = prints.iter().map(|print| print.qty).sum();
+        assert!((series.total_qty - want_qty).abs() < 1e-9, "and no volume was either");
+    }
+
+    /// The two order-flow panes must not put the same window's levels on different prices.
+    #[test]
+    fn the_profile_and_the_letter_grid_answer_the_same_levels_for_one_window() {
+        let db = chartkit_store::Db::in_memory().expect("in-memory store");
+        let prints = profile_prints();
+        db.record_trades(ID, &prints).expect("prints");
+
+        // Exactly what `/api/profile` builds, at the same row width the grid is asked for.
+        let mut builder = VolumeProfileBuilder::with_step(TICK, 20);
+        for print in &prints {
+            builder.on_trade(print);
+        }
+        let profile = builder.build(ID, 0.7);
+        let series = grid(&db, 20, ValueAreaBasis::Volume);
+
+        assert_eq!(series.sessions.len(), 1, "three hours of prints sit inside one UTC session");
+        let session = series.sessions.first().expect("one session");
+        assert_eq!(session.poc, profile.poc, "the point of control moved between the two panes");
+        assert_eq!((session.vah, session.val), (profile.vah, profile.val), "so did a value-area edge");
+        assert!((session.total_qty - profile.total_qty).abs() < 1e-9, "and the volume they are computed from");
+        // The row width the pane draws is a transport choice, not a resolution choice.
+        let fine = grid(&db, 1, ValueAreaBasis::Volume);
+        let fine = fine.sessions.first().expect("one session");
+        assert_eq!((fine.poc, fine.vah, fine.val), (session.poc, session.vah, session.val), "levels moved with the row width");
+    }
+
+    #[test]
+    fn a_grid_that_would_split_a_session_across_a_letter_is_refused() {
+        let grid = tpo_grid(None, None, None).expect("the defaults");
+        assert_eq!(
+            (grid.bucket_minutes, grid.session_minutes, grid.session_start_minute),
+            (DEFAULT_TPO_BUCKET_MINUTES, DEFAULT_TPO_SESSION_MINUTES, 0),
+            "the defaults are half-hour letters in UTC daily sessions"
+        );
+        assert!(tpo_grid(Some(60), Some(0), Some(1_440)).is_ok(), "an hour is a day's divisor");
+        // Seven minute buckets would put prints from two sessions under one letter.
+        assert!(tpo_grid(Some(7), Some(0), Some(1_440)).is_err());
+        assert!(tpo_grid(Some(60), Some(0), Some(90)).is_err(), "a session shorter than two buckets");
+        assert!(tpo_grid(Some(0), Some(0), Some(1_440)).is_err(), "a bucket of no minutes");
+        assert!(tpo_grid(Some(30), Some(-1), Some(1_440)).is_err(), "a session before the epoch day");
+        assert!(tpo_grid(Some(30), Some(1_440), Some(1_440)).is_err(), "a session starting off the day");
+        assert!(tpo_grid(Some(30), Some(17 * 60), Some(1_440)).is_ok(), "a 17:00 UTC session is what a futures trader wants");
+    }
+
+    #[test]
+    fn the_value_area_names_the_measure_it_was_cut_on() {
+        assert_eq!(value_area_basis(None).expect("default"), ValueAreaBasis::Volume, "volume is the default");
+        assert_eq!(value_area_basis(Some("volume")).expect("volume"), ValueAreaBasis::Volume);
+        assert_eq!(value_area_basis(Some("tpo")).expect("tpo"), ValueAreaBasis::Tpo);
+        assert!(value_area_basis(Some("money")).is_err());
+        assert!(value_area_basis(Some("")).is_ok(), "an empty parameter is the same as none");
+
+        let db = chartkit_store::Db::in_memory().expect("in-memory store");
+        db.record_trades(ID, &profile_prints()).expect("prints");
+        let by_volume = grid(&db, 1, ValueAreaBasis::Volume);
+        let by_letters = grid(&db, 1, ValueAreaBasis::Tpo);
+        assert!(by_volume.value_area_rule.contains("traded volume"), "{}", by_volume.value_area_rule);
+        assert!(by_letters.value_area_rule.contains("letters in the grid"), "{}", by_letters.value_area_rule);
+        assert!(by_volume.bucket_rule.contains("30 minute buckets"), "{}", by_volume.bucket_rule);
+        assert!(by_volume.session_rule.contains("1440 minute sessions"), "{}", by_volume.session_rule);
+    }
+
+    /// Prints missing for part of a window must read as missing, not as a session nobody
+    /// traded in.
+    #[test]
+    fn a_window_with_missing_prints_says_how_far_the_prints_reach() {
+        let db = chartkit_store::Db::in_memory().expect("in-memory store");
+        // Two buckets of prints, five buckets of silence, then three more buckets.
+        let prints: Vec<Trade> = (0..8i64)
+            .chain(40..56)
+            .map(|index| Trade {
+                ts: NOW + index * 7 * MINUTE,
+                seq: index as u64 + 1,
+                price: 100.0,
+                qty: 1.0,
+                aggressor: Side::Buy,
+            })
+            .collect();
+        db.record_trades(ID, &prints).expect("prints");
+        let series = grid(&db, 1, ValueAreaBasis::Volume);
+        assert_eq!(series.sessions.len(), 1, "the stretch stays inside one UTC day");
+        let session = series.sessions.first().expect("one session");
+
+        let starts: Vec<i64> = session.buckets.iter().map(|bucket| bucket.start).collect();
+        assert_eq!(starts.len(), 6, "only the buckets that traded get a letter");
+        assert_eq!(
+            (series.covered_from, series.covered_to),
+            (Some(starts[0]), Some(starts[5])),
+            "the answer has to say where its own prints start and stop"
+        );
+        assert_eq!(series.prints as usize, prints.len());
+        // A letter names a bucket's place in its session, not its place in the window: the
+        // session opens at 00:00 with A, and the prints here start at 02:00.
+        assert_eq!(session.letters, "EFNOPQ", "the letters spell the clock, gaps and all");
+        assert!(
+            starts.windows(2).any(|pair| pair[1] - pair[0] > 30 * MINUTE),
+            "the silent stretch stays visible as a gap between buckets: {starts:?}"
+        );
+        assert!(
+            !starts.windows(2).all(|pair| pair[1] - pair[0] == 30 * MINUTE),
+            "every bucket is present, so the gap was papered over: {starts:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_over_two_sessions_letters_each_one_from_a() {
+        let db = chartkit_store::Db::in_memory().expect("in-memory store");
+        // A day and a half of hourly prints, so the window crosses a session boundary.
+        let prints: Vec<Trade> = (0..36i64)
+            .map(|index| Trade {
+                ts: NOW + index * HOUR,
+                seq: index as u64 + 1,
+                price: 100.0 + (index % 4) as f64,
+                qty: 1.0,
+                aggressor: Side::Buy,
+            })
+            .collect();
+        db.record_trades(ID, &prints).expect("prints");
+        let grid = tpo_grid(Some(60), Some(0), Some(1_440)).expect("hourly buckets");
+        let series = tpo_series(&db, ID, None, None, grid, TICK, 1, 0.7, ValueAreaBasis::Volume, 400, NOW + 35 * HOUR).expect("grid");
+
+        assert_eq!(series.sessions.len(), 2, "22 buckets of one UTC day, 14 of the next");
+        for session in &series.sessions {
+            assert_eq!(session.end - session.start, DAY, "a session is a day of the grid");
+        }
+        assert_eq!(series.sessions[0].buckets.len(), 22, "from 02:00 to 23:00");
+        assert_eq!(series.sessions[1].buckets.len(), 14, "from 00:00 to 13:00");
+        // A letter is a bucket's place in its own session, not in the window on screen: the
+        // window opens at 02:00, so it opens on C, and the day the window enters whole opens
+        // on A. A trader moving the window must not be shown different letters for one clock.
+        assert_eq!(series.sessions[0].buckets.first().expect("a bucket").letter, "C");
+        assert_eq!(series.sessions[0].letters, "CDEFGHIJKLMNOPQRSTUVWX");
+        assert_eq!(series.sessions[1].buckets.first().expect("a bucket").letter, "A", "a session covered from its start opens at A");
+        // The levels are per session: blending them would put an edge between two auctions.
+        assert!(series.sessions.iter().all(|session| session.poc.is_some()));
+        assert!(series.sessions[1].developing, "the session the newest print is in is still developing");
+        assert!(!series.sessions[0].developing);
+        assert_eq!(series.prints as usize, prints.len(), "and every print is still counted once");
     }
 }

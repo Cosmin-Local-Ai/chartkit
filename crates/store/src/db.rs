@@ -46,6 +46,20 @@ pub struct SizeBandRow {
     pub sell_n: i64,
 }
 
+/// One cell of the TPO grid: what one time bucket traded at one venue tick, split by
+/// aggressor. The bucket is the bucket start in milliseconds and the level a tick index, so
+/// the answer is one row per traded (bucket, tick) pair whatever the window holds — the
+/// prints themselves never leave the store.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TpoCellRow {
+    pub bucket: i64,
+    pub level: i64,
+    pub buy_qty: f64,
+    pub sell_qty: f64,
+    pub buy_n: i64,
+    pub sell_n: i64,
+}
+
 /// One bar of a cluster search: every print the bar holds, and the part of it at or above
 /// the threshold. Keeping both is what lets a caller tell "this window holds no prints"
 /// apart from "nothing in it was big enough". `group` is a bar start in milliseconds.
@@ -782,6 +796,71 @@ impl Db {
         Ok(rows)
     }
 
+    /// Prints of one window cut into time buckets and venue price ticks, aggregated entirely
+    /// in SQL. The answer is one row per traded `(bucket, tick)` pair whatever the window
+    /// holds, so a wide window costs a scan of the window rather than a copy of itself, and
+    /// the caller folds the tick axis to whatever row width it draws.
+    ///
+    /// Buckets are anchored on `session_offset_ms` — the milliseconds past UTC midnight at
+    /// which a session starts — and spaced `bucket_ms` apart. The caller keeps `bucket_ms` a
+    /// divisor of its session length, which is what stops one bucket carrying prints from two
+    /// sessions; a test pins this expression to the grid the letters are assigned from.
+    pub fn tpo_cells(
+        &self,
+        instrument: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        bucket_ms: i64,
+        session_offset_ms: i64,
+        price_tick: f64,
+    ) -> Result<Vec<TpoCellRow>, StoreError> {
+        let mut rows = Vec::new();
+        self.tpo_cells_fold(instrument, from, to, bucket_ms, session_offset_ms, price_tick, |row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+
+    /// The same aggregation, streamed: `visit` sees one `(bucket, tick)` cell at a time, so a
+    /// caller that folds as it goes never holds the window. A 20 hour window at the venue's own
+    /// tick answers with half a million cells, and a `Vec` of them is memory the fold does not
+    /// need — this is the shape the API layer asks for.
+    pub fn tpo_cells_fold<F>(
+        &self,
+        instrument: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        bucket_ms: i64,
+        session_offset_ms: i64,
+        price_tick: f64,
+        mut visit: F,
+    ) -> Result<usize, StoreError>
+    where
+        F: FnMut(TpoCellRow) -> Result<(), StoreError>,
+    {
+        let guard = self.lock()?;
+        let mut stmt = guard.prepare_cached(TPO_CELLS_SQL)?;
+        let (oldest, newest) = window_bounds(from, to);
+        let args: [&dyn rusqlite::ToSql; 6] = [
+            &session_offset_ms,
+            &bucket_ms,
+            &price_tick,
+            &instrument,
+            &oldest,
+            &newest,
+        ];
+        let mut counted = 0usize;
+        {
+            let rows = stmt.query_map(args.as_slice(), read_tpo_cell_row)?;
+            for row in rows {
+                visit(row?)?;
+                counted += 1;
+            }
+        }
+        Ok(counted)
+    }
+
     /// Runs one size-band aggregation. The band edges are compared in the `CASE` in the
     /// order they arrive, so they bind as the first parameters of the statement and every
     /// other argument follows them.
@@ -881,6 +960,26 @@ impl Db {
             )?);
         }
         Ok(plans.join(" || "))
+    }
+
+    /// The plan of the TPO aggregation. A test hook, for the same reason as the size-band
+    /// plans: a grid that cannot ride the `(instrument, ts, seq)` seek walks every print an
+    /// instrument holds, and a market profile is asked for on every pan of the chart.
+    #[cfg(test)]
+    fn tpo_plan(&self) -> Result<String, StoreError> {
+        let guard = self.lock()?;
+        let mut stmt = guard.prepare_cached(
+            "EXPLAIN QUERY PLAN SELECT ts - (((ts - ?1) % ?2 + ?2) % ?2) AS bucket,
+                    CAST(ROUND(price / ?3) AS INTEGER) AS level,
+                    SUM(CASE WHEN aggressor = 'buy' THEN qty ELSE 0.0 END)
+               FROM trades
+              WHERE instrument_id = ?4 AND ts >= ?5 AND ts < ?6
+              GROUP BY bucket, level ORDER BY bucket, level",
+        )?;
+        read_plan(
+            &mut stmt,
+            rusqlite::params![0i64, 1_800_000i64, 0.01f64, "BINANCE:BTCUSDT", 0i64, 1i64],
+        )
     }
 
     /// The plans of the cluster search's two reads, joined. A test hook, for the same
@@ -1587,6 +1686,34 @@ fn read_cluster_bar_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClusterBarR
     })
 }
 
+/// One window's prints cut into time buckets and venue price ticks, aggregated entirely in SQL.
+///
+/// `ts - ((ts - a) % n + n) % n` is the floor of `ts - a` down to a multiple of `n`. SQLite's
+/// `/` and `%` truncate toward zero, so the shorter `a + (ts - a) / n * n` would put a print
+/// before the session anchor in the bucket after its own; a test pins this expression to the
+/// grid the letters are assigned from.
+const TPO_CELLS_SQL: &str = "SELECT ts - (((ts - ?1) % ?2 + ?2) % ?2) AS bucket,
+       CAST(ROUND(price / ?3) AS INTEGER) AS level,
+       SUM(CASE WHEN aggressor = 'buy' THEN qty ELSE 0.0 END),
+       SUM(CASE WHEN aggressor = 'sell' THEN qty ELSE 0.0 END),
+       SUM(CASE WHEN aggressor = 'buy' THEN 1 ELSE 0 END),
+       SUM(CASE WHEN aggressor = 'sell' THEN 1 ELSE 0 END)
+  FROM trades WHERE instrument_id = ?4 AND ts >= ?5 AND ts < ?6
+ GROUP BY bucket, level ORDER BY bucket, level";
+
+/// Reads one aggregated TPO cell: the bucket start and the tick index the row was grouped
+/// by, beside the volume and print counts of that one cell.
+fn read_tpo_cell_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TpoCellRow> {
+    Ok(TpoCellRow {
+        bucket: row.get(0)?,
+        level: row.get(1)?,
+        buy_qty: row.get(2)?,
+        sell_qty: row.get(3)?,
+        buy_n: row.get(4)?,
+        sell_n: row.get(5)?,
+    })
+}
+
 /// Reads one aggregated size-band row. The grouping column is a bar start or a tick
 /// index; the caller knows which because it asked for one or the other.
 fn read_size_band_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SizeBandRow> {
@@ -1882,6 +2009,7 @@ fn asset_class_from_tag(tag: String) -> AssetClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chartkit_core::TpoGrid;
 
     const ID: &str = "BINANCE:BTCUSDT";
     const HOUR: i64 = 3_600_000;
@@ -2654,5 +2782,147 @@ mod tests {
             );
             assert!(!plan.contains("SCAN trades"), "plan walks every print: {plan}");
         }
+    }
+
+    // ------------------------------------------------------------------ TPO grid
+
+    const MINUTE: i64 = 60_000;
+    const TICK: f64 = 0.5;
+
+    /// Prints over four half-hour buckets, on both bucket edges, across a session boundary,
+    /// and on five price ticks. Every quantity is a dyadic rational, so the sums below are
+    /// exact however SQL chooses to group them.
+    fn grid_prints() -> Vec<Trade> {
+        let prices = [100.0, 100.5, 101.0, 104.5, 110.0];
+        let qtys = [0.25, 1.0, 4.0];
+        let mut prints = Vec::new();
+        let mut seq = 1u64;
+        for minute in [0i64, 29, 30, 59, 60, 89, 90, 119, 121] {
+            for (level, price) in prices.iter().enumerate() {
+                for (slot, qty) in qtys.iter().enumerate() {
+                    prints.push(Trade {
+                        ts: minute * MINUTE + (level as i64 * 3 + slot as i64),
+                        seq,
+                        price: *price,
+                        qty: *qty,
+                        aggressor: if (minute + level as i64 + slot as i64) % 2 == 0 { Side::Buy } else { Side::Sell },
+                    });
+                    seq += 1;
+                }
+            }
+        }
+        prints
+    }
+
+    /// The grid the letters are assigned from, in core, versus the buckets the SQL computes.
+    /// If these drift, a letter on screen means a time span the answer never had.
+    #[test]
+    fn the_sql_buckets_are_the_buckets_the_letters_are_assigned_from() {
+        let db = Db::in_memory().expect("in-memory store");
+        let prints = grid_prints();
+        db.record_trades(ID, &prints).expect("prints");
+        // Half-hour buckets inside 24 hour sessions that begin at 17:00 UTC, so the buckets
+        // are not epoch-aligned and an off-by-one in either expression shows up.
+        let grid = TpoGrid::new(30, 1_440, 17 * 60).expect("grid");
+        let rows = db
+            .tpo_cells(ID, None, None, grid.bucket_ms(), grid.session_start_minute * MINUTE, TICK)
+            .expect("tpo aggregation");
+
+        let sql_buckets: std::collections::BTreeSet<i64> = rows.iter().map(|row| row.bucket).collect();
+        let want: std::collections::BTreeSet<i64> = prints
+            .iter()
+            .map(|print| grid.bucket_start(print.ts))
+            .collect();
+        assert_eq!(sql_buckets, want, "the store bucketed the prints somewhere else than the grid");
+        assert_eq!(want.iter().next().expect("a bucket").rem_euclid(grid.bucket_ms()), 0, "buckets sit on the session offset");
+        assert_eq!(want.len(), 5, "prints from minute 0 to minute 121 open five half-hour buckets");
+    }
+
+    /// The yardstick for the aggregation: the same window counted in plain Rust, with no SQL
+    /// and no grid object — just integer division of the prints the store was handed.
+    #[test]
+    fn the_tpo_grid_answers_the_same_cells_as_a_plain_rust_scan() {
+        let db = Db::in_memory().expect("in-memory store");
+        let prints = grid_prints();
+        db.record_trades(ID, &prints).expect("prints");
+        let bucket_ms = 30 * MINUTE;
+        let rows = db.tpo_cells(ID, None, None, bucket_ms, 0, TICK).expect("tpo aggregation");
+
+        let mut want: std::collections::BTreeMap<(i64, i64), Sided> = std::collections::BTreeMap::new();
+        for print in &prints {
+            let bucket = print.ts.div_euclid(bucket_ms) * bucket_ms;
+            let level = (print.price / TICK).round() as i64;
+            want.entry((bucket, level)).or_default().add(print);
+        }
+        let got: std::collections::BTreeMap<(i64, i64), Sided> = rows
+            .iter()
+            .map(|row| {
+                (
+                    (row.bucket, row.level),
+                    Sided { buy: row.buy_qty, sell: row.sell_qty, buy_n: row.buy_n, sell_n: row.sell_n },
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "one (bucket, tick) cell disagrees with the Rust count");
+        assert_eq!(rows.len(), want.len(), "the aggregation returned a cell the prints are not in");
+        let prints_counted: i64 = rows.iter().map(|row| row.buy_n + row.sell_n).sum();
+        assert_eq!(prints_counted, prints.len() as i64, "no print is counted twice or dropped");
+        let qty_counted: f64 = rows.iter().map(|row| row.buy_qty + row.sell_qty).sum();
+        let qty_want: f64 = prints.iter().map(|print| print.qty).sum();
+        assert!((qty_counted - qty_want).abs() < 1e-9, "and no volume is either");
+    }
+
+    #[test]
+    fn a_print_on_a_bucket_edge_belongs_to_the_bucket_it_starts() {
+        let db = Db::in_memory().expect("in-memory store");
+        let prints = [
+            Trade { ts: 30 * MINUTE - 1, seq: 1, price: 100.0, qty: 1.0, aggressor: Side::Buy },
+            Trade { ts: 30 * MINUTE, seq: 2, price: 100.0, qty: 2.0, aggressor: Side::Buy },
+            Trade { ts: 0, seq: 3, price: 100.0, qty: 4.0, aggressor: Side::Sell },
+        ];
+        db.record_trades(ID, &prints).expect("prints");
+        let rows = db.tpo_cells(ID, None, None, 30 * MINUTE, 0, TICK).expect("tpo aggregation");
+        let by_bucket: std::collections::BTreeMap<i64, i64> = rows.iter().fold(
+            std::collections::BTreeMap::new(),
+            |mut acc, row| {
+                *acc.entry(row.bucket).or_insert(0) += row.buy_n + row.sell_n;
+                acc
+            },
+        );
+        assert_eq!(
+            by_bucket.into_iter().collect::<Vec<_>>(),
+            vec![(0, 2), (30 * MINUTE, 1)],
+            "the last millisecond of a bucket stays in it, and the first millisecond of the next opens it"
+        );
+    }
+
+    #[test]
+    fn a_tpo_window_stops_at_its_bounds() {
+        let db = Db::in_memory().expect("in-memory store");
+        db.record_trades(ID, &grid_prints()).expect("prints");
+        let all = db.tpo_cells(ID, None, None, 30 * MINUTE, 0, TICK).expect("all");
+        let one = db
+            .tpo_cells(ID, Some(0), Some(30 * MINUTE), 30 * MINUTE, 0, TICK)
+            .expect("one bucket");
+        assert_eq!(
+            one.iter().map(|row| row.bucket).collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0]),
+            "the window leaked past its exclusive upper bound"
+        );
+        assert!(
+            one.iter().map(|row| row.buy_n + row.sell_n).sum::<i64>()
+                < all.iter().map(|row| row.buy_n + row.sell_n).sum::<i64>(),
+            "a narrower window answered with the whole range"
+        );
+    }
+
+    #[test]
+    fn the_tpo_aggregation_walks_the_print_index_and_not_the_table() {
+        let plan = Db::in_memory().expect("in-memory store").tpo_plan().expect("plan");
+        assert!(
+            plan.contains("SEARCH trades USING PRIMARY KEY") && plan.contains("ts>") && plan.contains("ts<"),
+            "the grid does not seek the (instrument, ts, seq) key by window: {plan}"
+        );
+        assert!(!plan.contains("SCAN trades"), "plan walks every print: {plan}");
     }
 }

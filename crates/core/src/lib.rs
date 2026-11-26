@@ -18,9 +18,10 @@ pub use alert::{
 };
 pub use bar::{Bar, BarAggregator};
 pub use flow::{
-    ClusterBar, ClusterPrint, ClusterSearch, DepthDelta, DepthSnapshot, FootprintBar,
+    tpo_letter, ClusterBar, ClusterPrint, ClusterSearch, DepthDelta, DepthSnapshot, FootprintBar,
     FootprintSeries, FootprintSeriesBuilder, Level, PriceCell, ProfileBucket, SizeBand,
-    SizeBandBar, SizeBandCell, SizeBandLevel, SizeBandSeries, SizeUnit, VolumeProfile,
+    SizeBandBar, SizeBandCell, SizeBandLevel, SizeBandSeries, SizeUnit, TpoBucket, TpoBuilder,
+    TpoCell, TpoGrid, TpoRow, TpoSeries, TpoSession, ValueAreaBasis, VolumeProfile,
     VolumeProfileBuilder, Side, Trade,
 };
 pub use id::new_id;

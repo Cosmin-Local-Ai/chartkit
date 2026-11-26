@@ -121,6 +121,17 @@ if (!read.ok) {
       back.footprint.stackedImbalances === document.footprint.stackedImbalances,
     json(back.footprint),
   );
+  check(
+    'TPO settings survive',
+    back.tpo.periodLength.count === document.tpo.periodLength.count &&
+      back.tpo.periodLength.unit === document.tpo.periodLength.unit &&
+      back.tpo.sessionStartMinute === document.tpo.sessionStartMinute &&
+      back.tpo.valueAreaMethod === document.tpo.valueAreaMethod &&
+      back.tpo.letterMode === document.tpo.letterMode &&
+      back.tpo.profileSpacing === document.tpo.profileSpacing &&
+      json(back.tpo.customTPOColors) === json(document.tpo.customTPOColors),
+    json(back.tpo),
+  );
   check('pane visibility and heights survive', equal(back.panes, document.panes) && equal(back.weights, document.weights), json([back.panes, back.weights]));
   check('the custom-weights flag survives', back.weightsCustomized === true);
   check('the watchlist survives', json(back.watchlist) === json(document.watchlist), json(back.watchlist));
@@ -466,10 +477,10 @@ function sampleDocument(): WorkspaceState {
     timeframe: '5m',
     seriesStyle: 'candles',
     watchlist: ['BINANCE:BTCUSDT', 'BINANCE:ETHUSDT'],
-    // The size-band grid is part of the document like any other pane: switched on here so a
-    // file that turns it off cannot quietly restore it on.
-    panes: { volume: true, footprint: false, profile: true, sizeBands: true, ladder: false, sidebar: true },
-    weights: { price: 4.25, volume: 1.5, footprint: 2.75, profile: 1.25, sizeBands: 0.9 },
+    // The size-band grid and the TPO grid are panes like any other: switched on here so a
+    // file that turns them off cannot quietly restore them on.
+    panes: { volume: true, footprint: false, profile: true, sizeBands: true, tpo: true, ladder: false, sidebar: true },
+    weights: { price: 4.25, volume: 1.5, footprint: 2.75, profile: 1.25, sizeBands: 0.9, tpo: 1.4 },
     weightsCustomized: true,
     view,
     indicators: [
@@ -485,6 +496,18 @@ function sampleDocument(): WorkspaceState {
     ],
     recentTools: ['TrendLine', 'ElliottTripleCombo', 'Text'],
     footprint: { ...DEFAULT_STATE.footprint, valueArea: 0.6, imbalanceRatio: 4.5, stackedImbalances: 3, threshold: 12.25 },
+    // The TPO grid is settings too: the bucket, the session and the value-area method have to
+    // come back or the letters restore at a grid the trader never chose.
+    tpo: {
+      ...DEFAULT_STATE.tpo,
+      periodLength: { count: 4, unit: 'hour' },
+      sessionStartMinute: 17 * 60,
+      valueAreaPercentage: 0.5,
+      valueAreaMethod: 'tpo',
+      letterMode: 'blocks-only',
+      profileSpacing: 9,
+      customTPOColors: ['#101820', '#203040', '#305070', '#4b9cf5'],
+    },
     settings: {
       ...DEFAULT_STATE.settings,
       theme: 'light',

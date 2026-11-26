@@ -9,6 +9,7 @@ import type {
   InstrumentSummary,
   SizeBandSeries,
   Trade,
+  TpoSeries,
   VolumeProfile,
 } from './types';
 import type { AlertPayload } from './alertsModel';
@@ -113,6 +114,28 @@ export const api = {
    */
   profile: (instrument: string, window: BarWindow, valueArea: number): Promise<VolumeProfile> =>
     request(`/api/profile${query({ instrument, ...window, valueArea })}`),
+
+  /**
+   * The letter grid over `window`: time buckets across, price rows down, and the point of
+   * control and value area of every session the window covers. `options` carries the grid the
+   * letters are cut on — `bucket` and `session*` in minutes — and the pane sends the same grid
+   * it draws, so a letter on screen always names the span that produced it. `ticks` is the
+   * price row width in venue ticks; `valueAreaFrom` says whether the value area follows the
+   * money (`volume`) or the clock (`tpo`).
+   */
+  tpo: (
+    instrument: string,
+    window: BarWindow,
+    options: {
+      bucket: number;
+      sessionStart: number;
+      sessionLength: number;
+      valueArea: number;
+      valueAreaFrom: string;
+      ticks: number;
+      limit?: number;
+    },
+  ): Promise<TpoSeries> => request(`/api/tpo${query({ instrument, ...window, ...options })}`),
 
   /**
    * Prints of `window` split by order size. The band edges are the server's: `bands` names

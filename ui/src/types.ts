@@ -161,6 +161,94 @@ export interface SizeBandSeries {
   delta: number;
 }
 
+/** One time bucket crossed with one price row: what traded there, split by aggressor. */
+export interface TpoCell {
+  buyQty: number;
+  sellQty: number;
+  buyN: number;
+  sellN: number;
+}
+
+/**
+ * One time bucket of the letter grid. `letter` is the bucket's mark inside its session —
+ * `A` for the first — and `rows` pairs each price row that traded with its cell, as
+ * `[bottom edge, cell]`. A row the bucket never touched is absent, which is how a client
+ * tells "this bucket did not trade here" from "this bucket traded nothing".
+ */
+export interface TpoBucket {
+  start: number;
+  letter: string;
+  rows: [number, TpoCell][];
+  prints: number;
+  totalQty: number;
+  poc: number | null;
+}
+
+/**
+ * One price row of one session: how many letters sit in it, and what traded there. The
+ * count beside the row is the letter distribution a market profile is read by.
+ */
+export interface TpoRow {
+  /** Bottom edge of the row, `priceTick * stepTicks` wide. */
+  price: number;
+  tpoCount: number;
+  prints: number;
+  buyQty: number;
+  sellQty: number;
+  totalQty: number;
+}
+
+/**
+ * One session of the grid. Letters restart at `A` here, and so do the point of control and
+ * the value area: a window that straddles a session boundary answers one block per session,
+ * never a blend of two auctions.
+ */
+export interface TpoSession {
+  start: number;
+  end: number;
+  /** The letters this session handed out, in order. */
+  letters: string;
+  buckets: TpoBucket[];
+  rows: TpoRow[];
+  poc: number | null;
+  vah: number | null;
+  val: number | null;
+  /** Fraction of the session the value area was asked to cover. */
+  valueArea: number;
+  /** Whether the value area followed the money or the clock. */
+  valueAreaBasis: 'volume' | 'tpo';
+  prints: number;
+  totalQty: number;
+  /** True while the session's newest bucket is still open at the newest stored print. */
+  developing: boolean;
+}
+
+/**
+ * Prints of a window cut into time buckets and price rows. `coveredFrom` and `coveredTo` are
+ * the oldest and newest bucket the answer actually carries: a bucket outside them is not a
+ * session nobody traded in, it is a stretch the stored prints do not reach.
+ */
+export interface TpoSeries {
+  instrument: string;
+  from: number | null;
+  to: number | null;
+  priceTick: number;
+  /** Venue ticks folded into one price row; 1 is the venue's own price grid. */
+  stepTicks: number;
+  bucketMinutes: number;
+  sessionMinutes: number;
+  sessionStartMinute: number;
+  /** How the grid was cut, in words the pane prints rather than infers. */
+  bucketRule: string;
+  sessionRule: string;
+  valueAreaRule: string;
+  sessions: TpoSession[];
+  prints: number;
+  totalQty: number;
+  coveredFrom: number | null;
+  coveredTo: number | null;
+}
+
 /**
  * One print at or above the cluster threshold. `notional` is the number the server filtered
  * on, sent rather than rebuilt by the client.

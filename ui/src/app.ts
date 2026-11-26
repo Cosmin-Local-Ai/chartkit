@@ -16,6 +16,7 @@ import { IndicatorPane } from './panes/indicatorPane';
 import { VolumePane } from './panes/volumePane';
 import { FootprintPane } from './panes/footprintPane';
 import { ProfilePane } from './panes/profilePane';
+import { TpoPane, rowsForPane } from './panes/tpoPane';
 import { SizeBandsPane } from './panes/sizeBandsPane';
 import { LiveClient } from './live';
 import type { ConnectionPhase } from './live';
@@ -36,8 +37,11 @@ import { ScriptRuntime } from './indicators/script/runtime';
 import type { IndicatorResult } from './indicators/registry';
 import { IndicatorDialog } from './indicatorDialog';
 import { FootprintSettingsDialog } from './footprintDialog';
+import { TpoSettingsDialog } from './tpoDialog';
 import { normaliseFootprintSettings } from './footprintSettings';
 import type { FootprintSettings } from './footprintSettings';
+import { normaliseTpoSettings } from './tpoSettings';
+import type { TpoSettings } from './tpoSettings';
 import { SettingsDialog } from './settingsDialog';
 import type { PrintRange } from './settingsDialog';
 import { ShortcutDialog } from './shortcutDialog';
@@ -104,8 +108,11 @@ const FOOTPRINT_CSV_LIMIT = 5_000;
 /** The volume profile follows the visible window on the same debounce as the footprint. */
 const PROFILE_DEBOUNCE_MS = 260;
 const PROFILE_LIVE_REFRESH_MS = 5_000;
+/** The TPO grid follows the visible window on the same debounce as the profile. */
+const TPO_DEBOUNCE_MS = 260;
+const TPO_LIVE_REFRESH_MS = 5_000;
 /** Panes that live in the stack and are switched by their own `setVisible`. */
-const STACK_PANES: readonly string[] = ['volume', 'footprint', 'profile', 'sizeBands'];
+const STACK_PANES: readonly string[] = ['volume', 'footprint', 'profile', 'sizeBands', 'tpo'];
 /** The size-band split follows the visible window on the same debounce as the profile. */
 const SIZE_PANE_DEBOUNCE_MS = 260;
 const SIZE_PANE_LIVE_REFRESH_MS = 5_000;
@@ -136,6 +143,7 @@ export class ChartApp {
   private readonly volumePane = new VolumePane();
   private readonly footprintPane = new FootprintPane();
   private readonly profilePane = new ProfilePane();
+  private readonly tpoPane = new TpoPane();
   private readonly sizeBandsPane = new SizeBandsPane();
   private readonly view = new ChartView();
   private readonly series = new Series();
@@ -179,6 +187,8 @@ export class ChartApp {
   private bandBuilt: { series: SizeBandSeries | null; loading: boolean; error: string | null; flow: SizeBandFlow } | null = null;
   private profileTimer: number | null = null;
   private profileFetchedAt = 0;
+  private tpoTimer: number | null = null;
+  private tpoFetchedAt = 0;
   private sizeBandsTimer: number | null = null;
   private sizeBandsFetchedAt = 0;
   private lastStatusTick = 0;
@@ -206,6 +216,7 @@ export class ChartApp {
   private drawingDialog!: DrawingDialog;
   private drawingMenu!: DrawingMenu;
   private footprintDialog!: FootprintSettingsDialog;
+  private tpoDialog!: TpoSettingsDialog;
   private settingsDialog!: SettingsDialog;
   private shortcutDialog!: ShortcutDialog;
   private alertsDialog!: AlertsDialog;
@@ -343,6 +354,11 @@ export class ChartApp {
       onPatch: (patch) => this.patchFootprint(patch),
     });
 
+    this.tpoDialog = new TpoSettingsDialog({
+      settings: () => this.state.tpo,
+      onPatch: (patch) => this.patchTpo(patch),
+    });
+
     // One settings dialog over every local setting. Chart type and price scale are mirrored
     // from the app rather than copied, so the top bar and the dialog cannot disagree.
     this.settingsDialog = new SettingsDialog({
@@ -455,6 +471,7 @@ export class ChartApp {
       onIndicators: () => this.indicatorDialog.toggle(),
       onAlerts: () => this.openAlerts(),
       onFootprintSettings: () => this.footprintDialog.toggle(),
+      onTpoSettings: () => this.tpoDialog.toggle(),
       onClusters: () => this.clusterDialog.toggle(),
       onSettings: () => this.settingsDialog.toggle(),
       onBackup: () => this.settingsDialog.showPage('backup'),
@@ -465,6 +482,7 @@ export class ChartApp {
       { id: 'footprint', label: 'Footprint' },
       { id: 'profile', label: 'Profile' },
       { id: 'sizeBands', label: 'Size bands' },
+      { id: 'tpo', label: 'TPO' },
       { id: 'ladder', label: 'Depth' },
       { id: 'sidebar', label: 'Watchlist' },
     ]);
@@ -489,6 +507,7 @@ export class ChartApp {
     this.stack.add({ id: 'footprint', weight: this.state.weights.footprint ?? 1.6, minPx: 140, draw: (ctx, frame) => this.footprintPane.draw(ctx, frame) });
     this.stack.add({ id: 'profile', weight: this.state.weights.profile ?? 1.2, minPx: 120, draw: (ctx, frame) => this.profilePane.draw(ctx, frame) });
     this.stack.add({ id: 'sizeBands', weight: this.state.weights.sizeBands ?? 1.1, minPx: 120, draw: (ctx, frame) => this.sizeBandsPane.draw(ctx, frame) });
+    this.stack.add({ id: 'tpo', weight: this.state.weights.tpo ?? 1.15, minPx: 130, draw: (ctx, frame) => this.tpoPane.draw(ctx, frame) });
     // Dragging a splitter is an explicit instruction about heights: from then on the user's
     // own weights rule and the price pane no longer reserves its minimum share.
     this.stack.enableSplitters(() => {
@@ -721,6 +740,12 @@ export class ChartApp {
       profileWindow: () => this.profilePane.window,
       profileDebug: () => this.profilePane.debugInfo,
       profileError: () => this.profilePane.error,
+      /** TPO pane: the window and grid it fetched, the letters it drew and its levels. */
+      tpoWindow: () => this.tpoPane.window,
+      tpoDebug: () => this.tpoPane.debugInfo,
+      tpoError: () => this.tpoPane.error,
+      tpoSettings: () => this.state.tpo,
+      tpoDialogOpen: () => this.tpoDialog.isOpen(),
       /** Size-band pane: the window it fetched, the bands it drew and the level under the cursor. */
       sizeBandsWindow: () => this.sizeBandsPane.window,
       sizeBandsDebug: () => this.sizeBandsPane.debugInfo,
@@ -800,6 +825,7 @@ export class ChartApp {
     this.footprintPane.settings = this.state.footprint;
     this.profilePane.settings = this.state.footprint;
     this.sizeBandsPane.settings = this.state.footprint;
+    this.tpoPane.settings = this.state.tpo;
     this.pricePane.style = this.state.seriesStyle;
     // Density and clock before the stored view: the stored zoom is clamped against the
     // stored floor, and it has to be clamped against the one the same document carries.
@@ -861,6 +887,7 @@ export class ChartApp {
     this.footprintPane.reset();
     this.profilePane.reset();
     this.sizeBandsPane.reset();
+    this.tpoPane.reset();
     this.resetFlow();
     this.resetBandFlow();
     // Marks belong to one instrument's prints, so a chart of another one must not wear them.
@@ -890,6 +917,7 @@ export class ChartApp {
     this.footprintPane.reset();
     this.profilePane.reset();
     this.sizeBandsPane.reset();
+    this.tpoPane.reset();
     this.resetFlow();
     this.resetBandFlow();
     // The counts are grouped by interval, so an answer counted in 1m bars cannot mark 5m ones.
@@ -1261,6 +1289,19 @@ export class ChartApp {
     this.footprintPane.settings = this.state.footprint;
     this.profilePane.settings = this.state.footprint;
     this.sizeBandsPane.settings = this.state.footprint;
+    this.markDirty();
+    this.persist();
+  }
+
+  /**
+   * Merges a TPO settings patch and re-normalises it. The grid fields are validated together:
+   * a bucket that stops dividing its session would ask the server for a grid it refuses, so the
+   * normaliser moves the bucket back to a divisor and the pane asks again on the next frame.
+   */
+  private patchTpo(patch: Partial<TpoSettings>): void {
+    const merged = { ...this.state.tpo, ...patch };
+    this.state.tpo = normaliseTpoSettings(merged);
+    this.tpoPane.settings = this.state.tpo;
     this.markDirty();
     this.persist();
   }
@@ -1972,6 +2013,7 @@ export class ChartApp {
       else if (host.id === 'footprint') this.footprintPane.draw(host.ctx, frame);
       else if (host.id === 'profile') this.profilePane.draw(host.ctx, frame);
       else if (host.id === 'sizeBands') this.sizeBandsPane.draw(host.ctx, frame);
+      else if (host.id === 'tpo') this.tpoPane.draw(host.ctx, frame);
       // Indicator panes carry their own draw closure, so they need no branch here.
       else if (host.id.startsWith(INDICATOR_PANE_PREFIX)) this.stack.defFor(host.id)?.draw(host.ctx, frame);
     }
@@ -1988,6 +2030,7 @@ export class ChartApp {
     this.scheduleBandFlow(x);
     this.scheduleProfile(x);
     this.scheduleSizeBands(x);
+    this.scheduleTpo(x);
   }
 
   private ensureDecor(bars: readonly Bar[]): void {
@@ -2348,6 +2391,42 @@ export class ChartApp {
         if (changed) this.markDirty();
       });
     }, PROFILE_DEBOUNCE_MS);
+  }
+
+  /**
+   * Fetches the letter grid of exactly the visible window, debounced like the profile. The
+   * window travels to the server because the grid does: a profile of a wider window could not
+   * be narrowed back to the view, since a bucket that straddles the view edge is only half
+   * answered. The price row width is asked for from the visible price span and the pane's own
+   * height, so the answer arrives already at the rows the pane can draw.
+   */
+  private scheduleTpo(x: XScale): void {
+    const instrument = this.instrument;
+    if (!instrument || !this.stack.isVisible('tpo')) return;
+    const bars = this.series.bars;
+    const { first, last } = x.visibleRange();
+    const newest = bars[Math.min(bars.length - 1, Math.max(0, last))];
+    const from = bars[Math.max(0, first)]?.start;
+    if (newest === undefined || from === undefined) return;
+    // `to` is exclusive, so one bar past the newest visible start keeps its open bucket in range.
+    const to = newest.start + this.series.barMs;
+    const price = this.framePrice;
+    const priceSpan = price ? price.max - price.min : 0;
+    const priceTick = instrument.priceTick;
+    const rows = rowsForPane(this.tpoPane.lastFrameHeight, this.state.tpo);
+    // One answer in flight at a time, as with the profile: a window this wide takes seconds,
+    // and a second copy queued behind it would only be dropped by the response guard.
+    if (this.tpoPane.loading) return;
+    const overdue = !newest.closed && Date.now() - this.tpoFetchedAt > TPO_LIVE_REFRESH_MS;
+    if (!overdue && !this.tpoPane.needsRefresh(instrument.id, from, to, priceSpan, priceTick)) return;
+    if (this.tpoTimer !== null) return;
+    this.tpoTimer = window.setTimeout(() => {
+      this.tpoTimer = null;
+      this.tpoFetchedAt = Date.now();
+      void this.tpoPane.refresh(instrument.id, from, to, priceSpan, priceTick, rows).then((changed) => {
+        if (changed) this.markDirty();
+      });
+    }, TPO_DEBOUNCE_MS);
   }
 
   private persist(): void {

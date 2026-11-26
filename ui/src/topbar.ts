@@ -19,6 +19,8 @@ export interface TopbarHandlers {
   /** The alerts panel: rules the server judges, and what they fired. */
   onAlerts: () => void;
   onFootprintSettings: () => void;
+  /** TPO / market profile: the grid its letters are cut on, and how it is drawn. */
+  onTpoSettings: () => void;
   /** Cluster search: the prints at or above a size, in a window. */
   onClusters: () => void;
   onSettings: () => void;
@@ -86,6 +88,7 @@ export class Topbar {
       // The Panes group already has a "Footprint" on/off toggle, so the settings entry
       // point spells itself out differently.
       actionButton('Footprint settings', 'Configure the footprint pane', () => handlers.onFootprintSettings()),
+      actionButton('TPO settings', 'Configure the time price opportunity pane', () => handlers.onTpoSettings()),
       actionButton('Clusters', 'Search the stored prints for the ones at or above a size', () =>
         handlers.onClusters(),
       ),
