@@ -1,0 +1,22 @@
+[package]
+name = "chartkit-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "chartkit"
+path = "src/main.rs"
+
+[dependencies]
+chartkit-core.workspace = true
+chartkit-store.workspace = true
+chartkit-ingest.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "chartkit-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+# Only the tests need it: the domain types describe their own wire form.
+serde_json.workspace = true

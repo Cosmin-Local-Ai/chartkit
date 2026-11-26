@@ -1,0 +1,16 @@
+[package]
+name = "chartkit-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chartkit-core.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls", "http2", "charset"] }
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,11 @@
+{
+  "$schema": "gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the main window. Its content is served by the app's own local server, so the page origin is a loopback port rather than the bundled app URL.",
+  "windows": ["main"],
+  "local": true,
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": ["core:default"]
+}

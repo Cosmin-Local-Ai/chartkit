@@ -1,0 +1,21 @@
+[package]
+name = "chartkit-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Desktop shell: a native window whose content is the same axum server the CLI
+# runs, hosted in this process on a background thread.
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+chartkit-core.workspace = true
+chartkit-server.workspace = true
+tauri.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true

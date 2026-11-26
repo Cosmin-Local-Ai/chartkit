@@ -1,0 +1,185 @@
+/* Wire types. Field names mirror the server exactly: every payload is camelCase. */
+
+export interface Bar {
+  start: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  trades: number;
+  closed: boolean;
+}
+
+export interface Trade {
+  ts: number;
+  seq: number;
+  price: number;
+  qty: number;
+  aggressor: 'buy' | 'sell';
+}
+
+export interface DepthLevel {
+  price: number;
+  qty: number;
+}
+
+export interface DepthSnapshot {
+  ts: number;
+  bids: DepthLevel[];
+  asks: DepthLevel[];
+}
+
+export interface Instrument {
+  id: string;
+  venue: string;
+  symbol: string;
+  display: string;
+  name: string;
+  assetClass: string;
+  priceTick: number;
+  qtyStep: number;
+  pricePrecision: number;
+  qtyPrecision: number;
+  quoteCurrency: string;
+  session: { timezone: string; windows: [number, string, string][] };
+  active: boolean;
+}
+
+export interface FootprintCell {
+  buyQty: number;
+  sellQty: number;
+  buyN: number;
+  sellN: number;
+}
+
+export interface FootprintBar {
+  start: number;
+  cells: [number, FootprintCell][];
+  totalQty: number;
+  delta: number;
+  trades: number;
+  poc: number;
+  buyImbalance: number[];
+  sellImbalance: number[];
+}
+
+export interface FootprintSeries {
+  instrument: string;
+  timeframe: string;
+  priceTick: number;
+  bars: FootprintBar[];
+  cvd: number[];
+}
+
+export interface ProfileBucket {
+  price: number;
+  buyQty: number;
+  sellQty: number;
+  totalQty: number;
+}
+
+/**
+ * Volume-by-price over one time window. The three levels are null when the window holds
+ * no prints, and `buckets` are venue-tick wide, so a busy window carries tens of
+ * thousands of them.
+ */
+export interface VolumeProfile {
+  instrument: string;
+  priceTick: number;
+  buckets: ProfileBucket[];
+  poc: number | null;
+  vah: number | null;
+  val: number | null;
+  totalQty: number;
+  /** Fraction of volume the value area was asked to cover. */
+  valueArea: number;
+}
+
+export interface Coverage {
+  bars: number;
+  instruments: number;
+  trades: number;
+  newestBar: number;
+}
+
+export interface InstrumentSummary {
+  count: number;
+  items: Instrument[];
+}
+
+export type FeedState = 'connecting' | 'backfilling' | 'live' | 'stalled' | 'failed';
+
+/**
+ * What a server-side rule watches. `price-*` rules are settled by each live print,
+ * `volume-above` and `delta-above` by a bar once it has closed.
+ */
+export type AlertKind = 'price-above' | 'price-below' | 'price-in-range' | 'volume-above' | 'delta-above';
+
+/**
+ * A rule the server judges, so it holds with the page closed. `armed` is the server's
+ * crossing state: false means the rule has answered for this crossing and is waiting for
+ * the level to be given back.
+ */
+export interface AlertRecord {
+  id: string;
+  instrument: string;
+  kind: AlertKind;
+  threshold: number;
+  thresholdHigh?: number;
+  timeframe?: string;
+  rearmGap: number;
+  label: string;
+  enabled: boolean;
+  muted: boolean;
+  createdAt: number;
+  updatedAt: number;
+  armed: boolean;
+  lastFiredAt?: number;
+}
+
+/**
+ * One fire. The condition is copied into the row, so the list still reads correctly after
+ * the rule that made it has been edited or deleted.
+ */
+export interface AlertFire {
+  id: string;
+  alertId: string;
+  instrument: string;
+  kind: AlertKind;
+  timeframe?: string;
+  threshold: number;
+  thresholdHigh?: number;
+  /** The observation that satisfied the rule: a print price, or a closed bar's quantity. */
+  value: number;
+  barStart?: number;
+  ts: number;
+  label: string;
+  muted: boolean;
+  /** Decided at startup from data stored while the server was down. */
+  missed: boolean;
+}
+
+export type LiveMessage =
+  | { type: 'hello'; time: number }
+  | { type: 'trades'; instrument: string; trades: Trade[] }
+  | { type: 'bar'; instrument: string; timeframe: string; bar: Bar }
+  | { type: 'depth'; instrument: string; snapshot: DepthSnapshot }
+  | { type: 'status'; instrument: string | null; state: FeedState; detail: string }
+  | { type: 'instruments'; venue: string; items: Instrument[] }
+  // A rule the server judged. Flat, so it reads like every other event on the socket.
+  | ({ type: 'alert' } & AlertFire);
+
+export const ASSET_CLASSES: { value: string; label: string }[] = [
+  { value: '', label: 'All classes' },
+  { value: 'equity', label: 'Equities' },
+  { value: 'etf', label: 'ETFs' },
+  { value: 'index', label: 'Indices' },
+  { value: 'future', label: 'Futures' },
+  { value: 'option', label: 'Options' },
+  { value: 'crypto-spot', label: 'Crypto spot' },
+  { value: 'perpetual', label: 'Perpetuals' },
+  { value: 'forex', label: 'Forex' },
+  { value: 'prediction', label: 'Predictions' },
+  { value: 'treasury', label: 'Treasuries' },
+];

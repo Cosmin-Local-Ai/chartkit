@@ -1,0 +1,52 @@
+name: windows installer
+
+# The Windows .exe is built here because the sandbox this project is developed in
+# has no MSVC toolchain. `desktop/README.md` documents the equivalent local command.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  nsis:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: chartkit-desktop
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      # The desktop crate bundles `ui/dist`, so the client has to be built first.
+      - name: Build web client
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build installer
+        working-directory: desktop
+        run: cargo tauri build
+
+      # A workspace build writes bundles under the workspace target dir; the second
+      # path covers the case where cargo is pointed at a crate-local target dir.
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: chartkit-windows-x64
+          path: |
+            target/release/bundle/nsis/*.exe
+            desktop/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

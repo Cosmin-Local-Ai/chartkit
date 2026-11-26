@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Core permissions for the main window. Its content is served by the app's own local server, so the page origin is a loopback port rather than the bundled app URL.","remote":{"urls":["http://127.0.0.1:*","http://localhost:*"]},"local":true,"windows":["main"],"permissions":["core:default"]}}
