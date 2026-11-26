@@ -75,7 +75,171 @@ export const FIB_RETRACE_LEVELS: LevelEntry[] = [
   { value: 4.764, color: '#00BCD4', enabled: false },
 ];
 
+/**
+ * The other shipped level sets. Each tool overrides the shared `fibLevels` default with the
+ * set its own `defaultStyle` carries, which is how the shipped schema does it too.
+ */
+function level(value: number, color: string, enabled: boolean): LevelEntry {
+  return { value, color, enabled };
+}
+
+/** `wt`, the set `FibChannel` ships with. */
+export const FIB_CHANNEL_LEVELS: LevelEntry[] = [
+  level(0, '#787B86', true),
+  level(0.236, '#F23645', true),
+  level(0.382, '#FF9800', true),
+  level(0.5, '#4CAF50', true),
+  level(0.618, '#089981', true),
+  level(0.786, '#00BCD4', true),
+  level(1, '#787B86', true),
+  level(1.272, '#9E7548', false),
+  level(1.414, '#F23645', false),
+  level(1.618, '#2962FF', true),
+  level(2, '#00BCD4', false),
+  level(2.272, '#9E7548', false),
+  level(2.414, '#4CAF50', false),
+  level(2.618, '#089981', true),
+  level(3, '#00BCD4', false),
+  level(3.272, '#787B86', false),
+  level(3.414, '#2962FF', false),
+  level(3.618, '#9C27B0', true),
+  level(4.236, '#E91E63', true),
+];
+
+/** `Et`, the set the polar tools — circles, speed arcs, wedge — ship with. */
+export const FIB_POLAR_LEVELS: LevelEntry[] = [
+  level(0.236, '#F23645', true),
+  level(0.382, '#FF9800', true),
+  level(0.5, '#4CAF50', true),
+  level(0.618, '#089981', true),
+  level(0.786, '#00BCD4', true),
+  level(1, '#787B86', true),
+  level(1.618, '#2962FF', false),
+  level(2.618, '#9C27B0', false),
+  level(3.618, '#E91E63', false),
+  level(4.236, '#9E7548', false),
+  level(4.618, '#F23645', false),
+];
+
+/** `Dt`, the Fibonacci time zones: whole-bar multiples along the Fibonacci sequence. */
+export const FIB_TIME_LEVELS: LevelEntry[] = [
+  level(0, '#787B86', true),
+  ...[1, 2, 3, 5, 8, 13, 21, 34, 55, 89].map((value) => level(value, '#2962FF', true)),
+];
+
+/** `Ot`, the time levels `FibTrendTime` ships with. */
+export const FIB_TREND_TIME_LEVELS: LevelEntry[] = [
+  level(0, '#787B86', true),
+  level(0.382, '#F23645', true),
+  level(0.5, '#81C784', false),
+  level(0.618, '#4CAF50', true),
+  level(0.786, '#00BCD4', true),
+  level(1, '#787B86', true),
+  level(1.382, '#FF9800', true),
+  level(1.618, '#2962FF', true),
+  level(2, '#089981', true),
+  level(2.618, '#9C27B0', true),
+  level(3.618, '#E91E63', true),
+];
+
+/** `kt`, the level set `Pitchfan` ships with. */
+export const PITCHFAN_LEVELS: LevelEntry[] = [
+  level(0.25, '#FFB74D', false),
+  level(0.382, '#81C784', false),
+  level(0.5, '#089981', true),
+  level(0.618, '#089981', false),
+  level(0.75, '#00BCD4', false),
+  level(1, '#2962FF', true),
+  level(1.5, '#9C27B0', false),
+  level(1.75, '#E91E63', false),
+];
+
+/** `Tt` and `Nt`, the quarter-turn sets the speed fan and the Gann box share. */
+export const QUARTER_LEVELS: LevelEntry[] = [
+  level(0, '#787B86', true),
+  level(0.25, '#F23645', true),
+  level(0.382, '#FF9800', true),
+  level(0.5, '#4CAF50', true),
+  level(0.618, '#089981', true),
+  level(0.75, '#00BCD4', true),
+  level(1, '#787B86', true),
+];
+
+/** `Pt`, the whole-number grid the square of nine is drawn on. */
+export const GANN_SQUARE_LEVELS: LevelEntry[] = [
+  level(0, '#787B86', true),
+  level(1, '#F23645', true),
+  level(2, '#FF9800', true),
+  level(3, '#4CAF50', true),
+  level(4, '#089981', true),
+  level(5, '#787B86', true),
+];
+
+/**
+ * The Gann angle sets. A shipped entry is a `{coeff1, coeff2}` pair; every shipped pair is
+ * `(n, 1)` or `(1, n)`, so the ratio alone names it again and the entry fits the same
+ * `{value, color, enabled}` shape the level editor already renders. `gannAngleFor` decodes it.
+ */
+export const GANN_FAN_LEVELS: LevelEntry[] = [
+  level(8, '#9598A1', true),
+  level(4, '#F23645', true),
+  level(3, '#FF9800', true),
+  level(2, '#4CAF50', true),
+  level(1, '#00BCD4', true),
+  level(0.5, '#4CAF50', true),
+  level(1 / 3, '#FF9800', true),
+  level(0.25, '#F23645', true),
+  level(0.125, '#9598A1', true),
+];
+
+/** `Mt`, the angles `GannSquare` fans with; most ship switched off. */
+export const GANN_SQUARE_FANS: LevelEntry[] = [
+  level(8, '#9598A1', false),
+  level(5, '#2962FF', false),
+  level(4, '#F23645', false),
+  level(3, '#FF9800', false),
+  level(2, '#4CAF50', true),
+  level(1, '#00BCD4', true),
+  level(0.5, '#4CAF50', true),
+  level(1 / 3, '#FF9800', false),
+  level(0.25, '#F23645', false),
+  level(0.2, '#2962FF', false),
+  level(0.125, '#9598A1', false),
+];
+
+/** `Ft`, the square-of-nine arcs. A shipped entry is `{x, y}`; only `hypot(x, y)` is ever read
+ * from it, so the radius multiple alone carries the entry. */
+export const GANN_SQUARE_ARCS: LevelEntry[] = [
+  level(1, '#FF9800', true),
+  level(Math.SQRT2, '#FF9800', true),
+  level(1.5, '#F23645', true),
+  level(2, '#00BCD4', true),
+  level(Math.hypot(2, 1), '#00BCD4', true),
+  level(3, '#4CAF50', true),
+  level(Math.hypot(3, 1), '#4CAF50', true),
+  level(4, '#089981', true),
+  level(Math.hypot(4, 1), '#089981', true),
+  level(5, '#2962FF', true),
+  level(Math.hypot(5, 1), '#2962FF', true),
+];
+
 const LINE_STYLES = ['solid', 'dashed', 'dotted'] as const;
+
+/**
+ * The `{coeff1, coeff2}` pair a Gann level stands for. The ratio is stored, so a level typed
+ * in the editor that no shipped pair has still resolves to a pair the renderer can use.
+ */
+export function gannAngleFor(value: number): { coeff1: number; coeff2: number } {
+  if (!Number.isFinite(value) || value <= 0) return { coeff1: 1, coeff2: 1 };
+  return value >= 1 ? { coeff1: value, coeff2: 1 } : { coeff1: 1, coeff2: 1 / value };
+}
+
+/** The angle's name, printed the way their labels print it: `1x1`, `1x2`, `2x1`. */
+export function gannAngleLabel(value: number): string {
+  const { coeff1, coeff2 } = gannAngleFor(value);
+  const whole = (n: number) => (Number.isInteger(n) ? `${n}` : n.toFixed(2));
+  return `${whole(coeff1)}x${whole(coeff2)}`;
+}
 
 function seg(key: string, label: string, value: string, options: readonly string[] = LINE_STYLES): StyleDescriptor {
   return { key, label, kind: 'segmented', default: value, options };
@@ -164,6 +328,17 @@ const STYLE_ENTRIES: readonly StyleDescriptor[] = [
     select('levelFormat', 'Label format', 'value', ['value', 'percent']),
     toggle('reverse', 'Reverse', false),
     { key: 'fibLevels', label: 'Levels', kind: 'levels', default: FIB_RETRACE_LEVELS.map(cloneLevel) },
+    { key: 'hLevels', label: 'Horizontal levels', kind: 'levels', default: QUARTER_LEVELS.map(cloneLevel) },
+    { key: 'vLevels', label: 'Vertical levels', kind: 'levels', default: QUARTER_LEVELS.map(cloneLevel) },
+    { key: 'gannLevels', label: 'Gann angles', kind: 'levels', default: GANN_FAN_LEVELS.map(cloneLevel) },
+    { key: 'fans', label: 'Fans', kind: 'levels', default: GANN_SQUARE_FANS.map(cloneLevel) },
+    { key: 'arcs', label: 'Arcs', kind: 'levels', default: GANN_SQUARE_ARCS.map(cloneLevel) },
+    color('gridColor', 'Grid colour', '#9598A1'),
+    toggle('gridVisible', 'Grid', true),
+    toggle('fansVisible', 'Fans', false),
+    color('fansColor', 'Fan colour', '#9598A1'),
+    toggle('showText', 'Range text', true),
+    toggle('counterclockwise', 'Counterclockwise', false),
     num('accountSize', 'Account size', 1000, { min: 0, step: 1 }),
     num('risk', 'Risk', 25, { min: 0, step: 1 }),
     select('riskDisplayMode', 'Risk unit', 'percents', ['percents', 'money']),

@@ -149,6 +149,94 @@ if (allToolsRead.ok) {
   check('nothing was reported as repaired', allToolsRead.summary.repaired.length === 0, allToolsRead.summary.repaired.join('; '));
 }
 
+// ------------------------------- 3b. the shipped gannFib group, id by id
+
+/**
+ * The shipped identity table for the `gannFib` group, read out of the shipped bundle. Every row
+ * is a claim the registry has to agree with: an anchor count one off makes a different tool.
+ */
+const SHIPPED_GANN_FIB: readonly { id: string; anchorCount: number; sectionKey: string }[] = [
+  { id: 'FibonacciRetracement', anchorCount: 2, sectionKey: 'fibonacci' },
+  { id: 'FibonacciTrend', anchorCount: 3, sectionKey: 'fibonacci' },
+  { id: 'FibChannel', anchorCount: 3, sectionKey: 'fibonacci' },
+  { id: 'Pitchfan', anchorCount: 3, sectionKey: 'fibonacci' },
+  { id: 'FibTimeZone', anchorCount: 2, sectionKey: 'fibonacci' },
+  { id: 'FibTrendTime', anchorCount: 3, sectionKey: 'fibonacci' },
+  { id: 'FibCircles', anchorCount: 2, sectionKey: 'fibonacci' },
+  { id: 'FibSpeedResistanceArcs', anchorCount: 2, sectionKey: 'fibonacci' },
+  { id: 'FibSpeedResistanceFan', anchorCount: 2, sectionKey: 'fibonacci' },
+  { id: 'FibWedge', anchorCount: 2, sectionKey: 'fibonacci' },
+  { id: 'FibSpiral', anchorCount: 2, sectionKey: 'fibonacci' },
+  { id: 'GannBox', anchorCount: 2, sectionKey: 'gann' },
+  { id: 'GannSquare', anchorCount: 2, sectionKey: 'gann' },
+  { id: 'GannSquareFixed', anchorCount: 2, sectionKey: 'gann' },
+  { id: 'GannFan', anchorCount: 2, sectionKey: 'gann' },
+];
+
+for (const shipped of SHIPPED_GANN_FIB) {
+  const tool = toolById(shipped.id);
+  check(`${shipped.id} exists`, tool !== null);
+  if (!tool) continue;
+  check(`${shipped.id} takes ${shipped.anchorCount} anchors`, tool.anchorCount === shipped.anchorCount, `registry says ${tool.anchorCount}`);
+  check(`${shipped.id} declares ${shipped.anchorCount} anchor axes`, tool.anchorAxes.length === shipped.anchorCount, `axes: ${tool.anchorAxes.length}`);
+  check(`${shipped.id} sits in group gannFib`, tool.group === 'gannFib', tool.group);
+  check(`${shipped.id} lists under ${shipped.sectionKey}`, tool.sectionKey === shipped.sectionKey, tool.sectionKey);
+}
+check(
+  'the registry holds no other gannFib tool than the shipped fifteen',
+  DRAWING_TOOLS.filter((tool) => tool.group === 'gannFib').length === SHIPPED_GANN_FIB.length,
+  DRAWING_TOOLS.filter((tool) => tool.group === 'gannFib')
+    .map((tool) => tool.id)
+    .join(', '),
+);
+
+// Three representatives — the lowest anchor count, a middle one, and the widest tool in the
+// registry — written out at anchor values no default would guess, then read back.
+const GANN_REPRESENTATIVES: readonly { id: string; anchors: { time: number; price: number }[] }[] = [
+  {
+    id: 'GannBox',
+    anchors: [
+      { time: 1_764_000_000_000, price: 61_234.5 },
+      { time: 1_764_008_400_000, price: 58_910.25 },
+    ],
+  },
+  {
+    id: 'FibonacciTrend',
+    anchors: [
+      { time: 1_764_000_000_000, price: 58_100.75 },
+      { time: 1_764_006_600_000, price: 61_480.5 },
+      { time: 1_764_013_800_000, price: 62_905.125 },
+    ],
+  },
+  {
+    id: 'ElliottTripleCombo',
+    anchors: Array.from({ length: 8 }, (_, index) => ({ time: 1_764_000_000_000 + index * 222_000, price: 60_000 - index * 91.375 })),
+  },
+];
+
+const gannDoc = structuredClone(DEFAULT_STATE);
+gannDoc.drawings = GANN_REPRESENTATIVES.map((entry, index) => {
+  const tool = toolById(entry.id)!;
+  return {
+    id: `d-gann-${index}`,
+    toolId: entry.id,
+    anchors: entry.anchors,
+    style: defaultsForKeys(tool.styleKeys, tool.styleDefaults),
+  };
+});
+const gannRoundTrip = readWorkspaceFile(serialiseWorkspaceFile(buildWorkspaceFile(gannDoc, 1_764_100_000_000)));
+check('a document of the representative gann and fib drawings is accepted', gannRoundTrip.ok, gannRoundTrip.ok ? '' : (gannRoundTrip as { error: string }).error);
+if (gannRoundTrip.ok) {
+  for (const entry of GANN_REPRESENTATIVES) {
+    const back = gannRoundTrip.state.drawings.find((instance) => instance.toolId === entry.id);
+    check(`${entry.id} comes back`, back !== undefined);
+    if (!back) continue;
+    check(`${entry.id} keeps all ${entry.anchors.length} anchors`, back.anchors.length === entry.anchors.length, String(back.anchors.length));
+    check(`${entry.id} keeps its named anchor values`, equal(back.anchors, entry.anchors), json(back.anchors));
+  }
+  check('the representative round-trip reports no repair', gannRoundTrip.summary.repaired.length === 0, gannRoundTrip.summary.repaired.join('; '));
+}
+
 // ------------------------------------------------------------------ 4. refusals
 
 const current = normaliseState(document);

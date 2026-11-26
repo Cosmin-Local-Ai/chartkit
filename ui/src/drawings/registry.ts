@@ -18,8 +18,20 @@ import type { PriceScale, XScale } from '../scale';
 import type { Bar, Instrument } from '../types';
 import type { Pt } from './anchors';
 import {
+  FIB_CHANNEL_LEVELS,
+  FIB_POLAR_LEVELS,
   FIB_RETRACE_LEVELS,
+  FIB_TIME_LEVELS,
+  FIB_TREND_TIME_LEVELS,
+  GANN_FAN_LEVELS,
+  GANN_SQUARE_ARCS,
+  GANN_SQUARE_FANS,
+  GANN_SQUARE_LEVELS,
+  PITCHFAN_LEVELS,
+  QUARTER_LEVELS,
   fontCss,
+  gannAngleFor,
+  gannAngleLabel,
   fontStack,
   lineDash,
   styleBoolean,
@@ -142,6 +154,7 @@ export const TOOL_SECTIONS: { key: string; label: string }[] = [
   { key: 'labels', label: 'Labels' },
   { key: 'content', label: 'Content' },
   { key: 'fibonacci', label: 'Fibonacci' },
+  { key: 'gann', label: 'Gann' },
   { key: 'chartPatterns', label: 'Chart patterns' },
   { key: 'elliottWaves', label: 'Elliott waves' },
   { key: 'cycles', label: 'Cycles' },
@@ -1055,6 +1068,308 @@ function cycleOffsets(first: Pt, period: number, plot: PlotRect, toward: number)
   return out;
 }
 
+/* ---------------------------------------------------------- gann and fib geometry */
+
+/**
+ * The shipped `Ra` frame: the anchor a Gann or speed shape is drawn from, the anchor it
+ * points at, and the deltas between them, in pane pixels. `reverse` swaps the two, which is
+ * what the shipped `reverse` key does to all of them.
+ */
+function rayFrame(a: Pt, b: Pt, reverse: boolean): { o: Pt; t: Pt; ux: number; uy: number } {
+  const [from, to] = reverse ? [b, a] : [a, b];
+  return { o: from, t: to, ux: to.x - from.x, uy: to.y - from.y };
+}
+
+/** Where the ray from `o` along `dir` leaves the plot; null when it never enters it. */
+function rayToEnd(o: Pt, dirX: number, dirY: number, plot: PlotRect): Pt | null {
+  const clipped = clipLine(o, { x: o.x + dirX, y: o.y + dirY }, plot, 0, UNBOUNDED);
+  return clipped ? clipped[1] : null;
+}
+
+/**
+ * The direction the trend keeps going in past the second anchor. A third anchor that lands on
+ * the second gives no direction at all, so the shape falls back to running level to the edge.
+ */
+function trendDir(from: Pt, to: Pt, plot: PlotRect): Pt {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  if (Math.abs(dx) > 1 || Math.abs(dy) > 1) return { x: dx, y: dy };
+  return { x: Math.max(1, plot.right - plot.left), y: 0 };
+}
+
+/** Where the horizontal line at `y` meets the slanted line through `origin` with `dir`. */
+function slantedX(origin: Pt, dir: Pt, y: number): number {
+  return Math.abs(dir.y) < 1e-6 ? origin.x : origin.x + (dir.x * (y - origin.y)) / dir.y;
+}
+
+/** Where the vertical line at `x` meets the slanted line through `origin` with `dir`. */
+function slantedY(origin: Pt, dir: Pt, x: number): number {
+  return Math.abs(dir.x) < 1e-6 ? origin.y : origin.y + (dir.y * (x - origin.x)) / dir.x;
+}
+
+/** Level labels are drawn in the shipped mono face at 11px, whatever the tool is. */
+const LEVEL_FONT = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+
+/** The golden ratio: one quarter turn of a Fibonacci spiral multiplies the radius by it. */
+const PHI = (1 + Math.sqrt(5)) / 2;
+
+/** The `ratio  price` text a fib rule carries, in the format its `levelFormat` asks for. */
+function fibLevelText(value: number, price: number, style: StyleValues, env: ToolEnv): string {
+  const priceText = fmtPrice(price, precision(env));
+  return styleString(style, 'levelFormat', 'value') === 'percent'
+    ? `${(value * 100).toFixed(1)}% ${priceText}`
+    : `${value}  ${priceText}`;
+}
+
+/** Enabled levels, low to high: every shipped level renderer sorts before it draws. */
+function enabledLevels(levels: LevelEntry[]): LevelEntry[] {
+  return levels.filter((entry) => entry.enabled).sort((left, right) => left.value - right.value);
+}
+
+/** A rule's dash and width, read from the tool's own line style. */
+function levelPen(style: StyleValues, widthFallback = 2): { width: number; dash: number[] } {
+  return {
+    width: styleNumber(style, 'lineWidth', widthFallback),
+    dash: lineDash(styleString(style, 'lineStyle', 'solid')),
+  };
+}
+
+/**
+ * The shipped polar family — Fibonacci circles, speed-resistance arcs and the wedge — runs on
+ * one renderer: a centre, a radius unit, a sweep, and one rule per enabled level at
+ * `level × unit`. `closed` is the circles' full turn, where a band sits between neighbours;
+ * everywhere else the sweep is partial and each level fills back to the centre instead.
+ */
+function polarPrimitives(
+  anchors: Pt[],
+  style: StyleValues,
+  _env: ToolEnv,
+  levels: LevelEntry[],
+  shape: { centre: Pt; unit: number; from: number; to: number; closed: boolean },
+): Prim[] {
+  const out: Prim[] = [];
+  const first = anchors[0];
+  const second = anchors[1];
+  if (!first || !second) return out;
+  if (!(shape.unit > 1)) return [segment(first, second, styleColor(style, 'color'), levelPen(style).width, levelPen(style).dash)];
+
+  const pen = levelPen(style);
+  const opacity = styleNumber(style, 'backgroundOpacity', 10);
+  const fill = styleBoolean(style, 'fillBackground', true);
+  const enabled = enabledLevels(levels);
+  const mid = (shape.from + shape.to) / 2;
+  const steps = Math.max(12, Math.ceil((64 * Math.abs(shape.to - shape.from)) / (2 * Math.PI)));
+
+  for (const level of enabled) {
+    const radius = shape.unit * level.value;
+    if (!(radius > 0)) continue;
+    const ring = arcPoints(shape.centre, radius, shape.from, shape.to, steps);
+    if (fill) {
+      if (shape.closed) {
+        const next = enabled.find((other) => other.value > level.value);
+        if (next) {
+          const inner = arcPoints(shape.centre, shape.unit * next.value, shape.from, shape.to, steps).reverse();
+          out.push(polygon([...ring, ...inner], withOpacity(level.color, opacity)));
+        }
+      } else {
+        out.push(polygon([shape.centre, ...ring], withOpacity(level.color, opacity)));
+      }
+    }
+    for (let i = 1; i < ring.length; i += 1) {
+      const from = ring[i - 1];
+      const to = ring[i];
+      if (from && to) out.push(segment(from, to, level.color, pen.width, pen.dash));
+    }
+    if (!styleBoolean(style, 'showLabels', true)) continue;
+    const at = polar(shape.centre, mid, radius);
+    out.push({
+      kind: 'label',
+      at,
+      text: `${level.value}`,
+      options: { color: level.color, font: LEVEL_FONT, align: 'center', baseline: 'bottom' },
+      auto: true,
+    });
+  }
+  // The shipped chrome: a plain rule between the first two anchors, drawn last so it stays on top.
+  out.push(segment(first, second, styleColor(style, 'trendLineColor', '#B0B0B0'), styleNumber(style, 'trendLineLineWidth', 2), lineDash(styleString(style, 'trendLineLineStyle', 'dashed'))));
+  return out;
+}
+
+/**
+ * Gann angles radiating from the first anchor. Each level is a `{coeff1, coeff2}` pair, and the
+ * shipped renderer sends its ray off in the direction `(coeff2 × the anchor run, coeff1 × the
+ * anchor rise)`, so the pair a level holds is decoded from the ratio it stores. Rays are sorted
+ * by angle and the wedge between neighbours is filled with the steeper neighbour's colour.
+ */
+function gannFanPrimitives(
+  anchors: Pt[],
+  style: StyleValues,
+  env: ToolEnv,
+  levels: LevelEntry[],
+  clip: Pt[],
+): Prim[] {
+  const out: Prim[] = [];
+  const first = anchors[0];
+  const second = anchors[1];
+  if (!first || !second) return out;
+  const frame = rayFrame(first, second, styleBoolean(style, 'reverse', false));
+  if (frame.ux === 0 || frame.uy === 0) {
+    const pen = levelPen(style, 1);
+    return [segment(frame.o, frame.t, styleColor(style, 'color', '#9598A1'), pen.width, pen.dash)];
+  }
+  const enabled = enabledLevels(levels);
+  const rays = enabled
+    .map((level) => {
+      const angle = gannAngleFor(level.value);
+      const dirX = angle.coeff2 * frame.ux;
+      const dirY = angle.coeff1 * frame.uy;
+      return { level, end: rayToEnd(frame.o, dirX, dirY, env.plot), angle: Math.atan2(dirY, dirX) };
+    })
+    .filter((ray): ray is { level: LevelEntry; end: Pt; angle: number } => ray.end !== null && Number.isFinite(ray.angle))
+    .sort((left, right) => left.angle - right.angle);
+
+  const opacity = styleNumber(style, 'backgroundOpacity', 10);
+  if (styleBoolean(style, 'fillBackground', true)) {
+    for (let i = 0; i < rays.length - 1; i += 1) {
+      const near = rays[i];
+      const next = rays[i + 1];
+      if (!near || !next) continue;
+      // The shipped fill takes the steeper of the two neighbours, judged on the raw ratio.
+      const donor = near.level.value >= next.level.value ? near.level : next.level;
+      out.push(polygon([frame.o, near.end, next.end], withOpacity(donor.color, opacity)));
+    }
+  }
+  const pen = levelPen(style, 1);
+  const showLabels = styleBoolean(style, 'showLabels', true);
+  const reach = Math.hypot(frame.ux, frame.uy);
+  for (const ray of rays) {
+    const line = clip ? clipLine(frame.o, ray.end, env.plot, 0, 1) : null;
+    const from = line ? line[0] : frame.o;
+    const to = line ? line[1] : ray.end;
+    out.push(segment(from, to, ray.level.color, pen.width, pen.dash));
+    if (!showLabels) continue;
+    const length = Math.hypot(ray.end.x - frame.o.x, ray.end.y - frame.o.y);
+    if (!(length > 0)) continue;
+    const at = { x: frame.o.x + ((ray.end.x - frame.o.x) * (reach + 24)) / length, y: frame.o.y + ((ray.end.y - frame.o.y) * (reach + 24)) / length };
+    out.push({
+      kind: 'label',
+      at,
+      text: gannAngleLabel(ray.level.value),
+      options: { color: ray.level.color, font: LEVEL_FONT, align: frame.ux >= 0 ? 'left' : 'right', baseline: 'middle' },
+      auto: true,
+    });
+  }
+  return out;
+}
+
+/**
+ * The square of nine. The two anchors set one level unit in each axis — level `v` sits at
+ * `origin + delta × v` — and the grid runs out to level 5 in both, which is how far the shipped
+ * renderer draws it. `fixed` holds the cells square on screen by trimming the longer axis to the
+ * shorter one, which is the only thing the shipped fixed variant can do without a stored ratio.
+ */
+function gannSquarePrimitives(anchors: Pt[], style: StyleValues, env: ToolEnv, fixed: boolean): Prim[] {
+  const out: Prim[] = [];
+  const first = anchors[0];
+  const second = anchors[1];
+  if (!first || !second) return out;
+  const frame = rayFrame(first, second, styleBoolean(style, 'reverse', false));
+  const pen = levelPen(style, 1);
+  if (frame.ux === 0 || frame.uy === 0) {
+    return [segment(frame.o, frame.t, styleColor(style, 'color', '#9598A1'), pen.width, pen.dash)];
+  }
+  const ux = fixed ? Math.sign(frame.ux) * Math.min(Math.abs(frame.ux), Math.abs(frame.uy)) : frame.ux;
+  const uy = fixed ? Math.sign(frame.uy) * Math.min(Math.abs(frame.ux), Math.abs(frame.uy)) : frame.uy;
+  const reach = GANN_SQUARE_LEVELS[GANN_SQUARE_LEVELS.length - 1]?.value ?? 5;
+  const edgeX = frame.o.x + ux * reach;
+  const edgeY = frame.o.y + uy * reach;
+  const box = {
+    left: Math.min(frame.o.x, edgeX),
+    right: Math.max(frame.o.x, edgeX),
+    top: Math.min(frame.o.y, edgeY),
+    bottom: Math.max(frame.o.y, edgeY),
+  };
+  const clampBox = (pt: Pt): Pt => ({
+    x: Math.min(Math.max(pt.x, box.left), box.right),
+    y: Math.min(Math.max(pt.y, box.top), box.bottom),
+  });
+
+  const hLevels = enabledLevels(styleLevels(style, 'hLevels'));
+  const vLevels = enabledLevels(styleLevels(style, 'vLevels'));
+  const showLabels = styleBoolean(style, 'showLabels', true);
+  for (const level of hLevels) {
+    const y = frame.o.y + uy * level.value;
+    out.push(segment({ x: box.left, y }, { x: box.right, y }, level.color, pen.width, pen.dash));
+    if (showLabels) {
+      out.push({
+        kind: 'label',
+        at: { x: box.left - 5, y },
+        text: `${level.value}`,
+        options: { color: level.color, font: LEVEL_FONT, align: 'right', baseline: 'middle' },
+        auto: true,
+      });
+    }
+  }
+  for (const level of vLevels) {
+    const x = frame.o.x + ux * level.value;
+    out.push(segment({ x, y: box.top }, { x, y: box.bottom }, level.color, pen.width, pen.dash));
+    if (showLabels) {
+      out.push({
+        kind: 'label',
+        at: { x, y: box.bottom + 5 },
+        text: `${level.value}`,
+        options: { color: level.color, font: LEVEL_FONT, align: 'center', baseline: 'top' },
+        auto: true,
+      });
+    }
+  }
+
+  // Fans and arcs both live inside the square, so the shipped renderer clips them to it.
+  for (const level of enabledLevels(styleLevels(style, 'fans'))) {
+    const angle = gannAngleFor(level.value);
+    const end = rayToEnd(frame.o, angle.coeff2 * ux, angle.coeff1 * uy, box);
+    if (!end) continue;
+    out.push(segment(frame.o, clampBox(end), level.color, pen.width, pen.dash));
+  }
+  const signX = Math.sign(ux);
+  const signY = Math.sign(uy);
+  for (const level of enabledLevels(styleLevels(style, 'arcs'))) {
+    const radiusX = Math.abs(level.value * ux);
+    const radiusY = Math.abs(level.value * uy);
+    if (!(radiusX > 0 && radiusY > 0)) continue;
+    const arc = ellipseQuadrant(frame.o, radiusX, radiusY, signX, signY, 24);
+    for (let i = 1; i < arc.length; i += 1) {
+      const from = arc[i - 1];
+      const to = arc[i];
+      if (from && to) out.push(segment(from, to, level.color, pen.width, pen.dash));
+    }
+  }
+
+  if (styleBoolean(style, 'showText', true)) {
+    const bars = Math.abs(Math.round(env.x.toIndex(second.x) - env.x.toIndex(first.x)));
+    const span = Math.abs(env.price.fromY(second.y) - env.price.fromY(first.y));
+    const unit = span > 0 && bars > 0 ? `${+(span / bars).toPrecision(4)}` : '-';
+    out.push({
+      kind: 'label',
+      at: { x: frame.o.x + (frame.ux >= 0 ? 6 : -6), y: frame.o.y - 6 },
+      text: `${bars} bars, ${fmtPrice(span, precision(env))} (${unit})`,
+      options: { color: '#9598A1', font: LEVEL_FONT, align: frame.ux >= 0 ? 'left' : 'right', baseline: 'bottom' },
+      auto: true,
+    });
+  }
+  return out;
+}
+
+/** Points along the quarter of an ellipse that runs from the major axis to the minor one. */
+function ellipseQuadrant(centre: Pt, radiusX: number, radiusY: number, signX: number, signY: number, steps: number): Pt[] {
+  const out: Pt[] = [];
+  for (let step = 0; step <= steps; step += 1) {
+    const angle = (Math.PI / 2) * (step / steps);
+    out.push({ x: centre.x + signX * radiusX * Math.cos(angle), y: centre.y + signY * radiusY * Math.sin(angle) });
+  }
+  return out;
+}
+
 /* ------------------------------------------------------------------ the tools */
 
 const LINE_STYLE_KEYS = ['color', 'lineWidth', 'lineStyle'] as const;
@@ -1509,6 +1824,838 @@ const CYCLE_TOOLS: readonly DrawingToolDefinition[] = [
       }
       return out;
     },
+  },
+];
+
+/* -------------------------------------------------- the shipped gann and fib tools */
+
+/** Keys the fib tools that draw horizontal rules share with the shipped retracement tool. */
+const FIB_RULE_STYLE_KEYS = [
+  'lineWidth',
+  'lineStyle',
+  'trendLineColor',
+  'trendLineLineWidth',
+  'trendLineLineStyle',
+  'backgroundOpacity',
+  'reverse',
+  'showLevels',
+  'showPrices',
+  'levelFormat',
+  'textPosition',
+  'fibLevels',
+] as const;
+
+/** The shipped `Lt` preset, which the retracement and the trend-based fib share. */
+const FIB_RULE_DEFAULTS: StyleValues = {
+  trendLineColor: '#B0B0B0',
+  trendLineLineStyle: 'dashed',
+  trendLineLineWidth: 2,
+  backgroundOpacity: 10,
+  reverse: false,
+  showLevels: true,
+  showPrices: true,
+  levelFormat: 'value',
+  textPosition: 'left',
+  fibLevels: FIB_RETRACE_LEVELS,
+};
+
+/** The shipped `Zt` preset the polar fib tools carry. */
+const POLAR_STYLE_KEYS = [
+  'color',
+  'lineWidth',
+  'lineStyle',
+  'trendLineColor',
+  'trendLineLineWidth',
+  'trendLineLineStyle',
+  'fillBackground',
+  'backgroundOpacity',
+  'showLabels',
+  'fibLevels',
+] as const;
+const POLAR_DEFAULTS: StyleValues = {
+  color: '#4DA3FF',
+  trendLineColor: '#B0B0B0',
+  trendLineLineStyle: 'dashed',
+  trendLineLineWidth: 2,
+  fillBackground: true,
+  backgroundOpacity: 10,
+  showLabels: true,
+  fibLevels: FIB_POLAR_LEVELS,
+};
+
+/** Keys and defaults for the tools that rule a band between two trend lines. */
+const CHANNEL_STYLE_KEYS = [
+  'lineWidth',
+  'lineStyle',
+  'trendLineColor',
+  'trendLineLineWidth',
+  'trendLineLineStyle',
+  'fillBackground',
+  'backgroundOpacity',
+  'showLabels',
+  'showPrices',
+  'levelFormat',
+  'textPosition',
+  'fibLevels',
+] as const;
+
+/**
+ * Rules across a band bounded by two parallel trend lines: level `v` sits at `a + (b - a) × v`
+ * and runs along `dir`. Bands between neighbours are filled with the upper level's colour, as
+ * the shipped channel and pitch-fan renderers fill them.
+ */
+function channelPrimitives(
+  anchors: Pt[],
+  style: StyleValues,
+  env: ToolEnv,
+  levels: LevelEntry[],
+  dir: Pt,
+  options: { extend: boolean; median: boolean },
+): Prim[] {
+  const out: Prim[] = [];
+  const a = anchors[0];
+  const b = anchors[1];
+  if (!a || !b) return out;
+  const pen = levelPen(style);
+  const enabled = enabledLevels(levels);
+  const opacity = styleNumber(style, 'backgroundOpacity', 10);
+  const fill = styleBoolean(style, 'fillBackground', true);
+  const position = styleString(style, 'textPosition', 'left');
+
+  const rule = (at: Pt): [Pt, Pt] | null =>
+    options.extend
+      ? clipLine(at, add(at, dir), env.plot, -UNBOUNDED, UNBOUNDED)
+      : clipLine(at, add(at, dir), env.plot, 0, 1);
+
+  const levelPoint = (value: number): Pt => ({ x: a.x + (b.x - a.x) * value, y: a.y + (b.y - a.y) * value });
+
+  for (let i = 0; i < enabled.length - 1; i += 1) {
+    const upper = enabled[i];
+    const lower = enabled[i + 1];
+    if (!upper || !lower || !fill) continue;
+    const from = levelPoint(upper.value);
+    const to = levelPoint(lower.value);
+    const near = rule(from);
+    const next = rule(to);
+    if (!near || !next) continue;
+    out.push(polygon([near[0], near[1], next[1], next[0]], withOpacity(upper.color, opacity)));
+  }
+
+  for (const level of enabled) {
+    const at = levelPoint(level.value);
+    const line = rule(at);
+    if (!line) continue;
+    out.push(segment(line[0], line[1], level.color, pen.width, pen.dash));
+    if (!styleBoolean(style, 'showLabels', true)) continue;
+    const at2 = line[1];
+    out.push({
+      kind: 'label',
+      at: { x: position === 'right' ? at2.x - 6 : at2.x + 6, y: at2.y - 7 },
+      text: fibLevelText(level.value, env.price.fromY(at.y), style, env),
+      options: { color: level.color, font: LEVEL_FONT, align: position === 'right' ? 'right' : 'left', baseline: 'bottom' },
+      auto: true,
+    });
+  }
+
+  if (options.median) {
+    const spine = mid(a, b);
+    const line = rule(spine);
+    if (line) {
+      const color = styleColor(style, 'medianColor', '#F23645');
+      const width = styleNumber(style, 'medianLineWidth', 2);
+      const dash = lineDash(styleString(style, 'medianLineStyle', 'solid'));
+      out.push(segment(line[0], line[1], color, width, dash));
+    }
+  }
+  return out;
+}
+
+/**
+ * The fourteen gann and fib tools the shipped schema carries that were missing here, at the
+ * anchor counts the shipped identity table gives them. `FibonacciRetracement` already lives in
+ * the main list, so the fifteenth member of the shipped `gannFib` group is not repeated.
+ */
+const GANN_FIB_TOOLS: readonly DrawingToolDefinition[] = [
+  {
+    id: 'FibonacciTrend',
+    label: 'Fibonacci Trend',
+    group: 'gannFib',
+    sectionKey: 'fibonacci',
+    anchorCount: 3,
+    anchorAxes: ['xy', 'xy', 'xy'],
+    glyph: 'ϕ+',
+    hint: 'Click the swing start, the swing end, then where the trend keeps running',
+    styleKeys: FIB_RULE_STYLE_KEYS,
+    styleDefaults: FIB_RULE_DEFAULTS,
+    primitives: (anchors, style, env) => {
+      const a = anchors[0];
+      const b = anchors[1];
+      const c = anchors[2];
+      if (!a || !b || !c) return [];
+      const out: Prim[] = [];
+      const dir = trendDir(b, c, env.plot);
+      const pa = priceAt(a, env);
+      const pb = priceAt(b, env);
+      const enabled = enabledLevels(styleLevels(style, 'fibLevels'));
+      const pen = levelPen(style);
+      const opacity = styleNumber(style, 'backgroundOpacity', 10);
+      const position = styleString(style, 'textPosition', 'left');
+
+      const spanAt = (y: number): [number, number] | null => {
+        const left = Math.min(slantedX(a, dir, y), slantedX(b, dir, y));
+        const right = Math.max(slantedX(a, dir, y), slantedX(b, dir, y));
+        if (!(right > left)) return null;
+        return [Math.max(left, env.plot.left), Math.min(right, env.plot.right)];
+      };
+
+      if (styleBoolean(style, 'showLevels', true)) {
+        for (let i = 0; i < enabled.length - 1; i += 1) {
+          const upper = enabled[i];
+          const lower = enabled[i + 1];
+          if (!upper || !lower) continue;
+          const y1 = env.price.toY(pa + (pb - pa) * upper.value);
+          const y2 = env.price.toY(pa + (pb - pa) * lower.value);
+          if (Math.abs(y2 - y1) < 0.5) continue;
+          const top = spanAt(y1);
+          const bottom = spanAt(y2);
+          if (!top || !bottom) continue;
+          out.push(polygon([{ x: top[0], y: y1 }, { x: top[1], y: y1 }, { x: bottom[1], y: y2 }, { x: bottom[0], y: y2 }], withOpacity(upper.color, opacity)));
+        }
+        for (const level of enabled) {
+          const value = pa + (pb - pa) * level.value;
+          const y = env.price.toY(value);
+          const span = spanAt(y);
+          if (!span) continue;
+          out.push(segment({ x: span[0], y }, { x: span[1], y }, level.color, pen.width, pen.dash));
+          if (!styleBoolean(style, 'showPrices', true)) continue;
+          out.push({
+            kind: 'label',
+            at: { x: position === 'right' ? span[1] - 6 : span[0] + 6, y: y - 7 },
+            text: fibLevelText(level.value, value, style, env),
+            options: { color: level.color, font: LEVEL_FONT, align: position === 'right' ? 'right' : 'left', baseline: 'bottom' },
+            auto: true,
+          });
+        }
+      }
+      const trend = stroke(style, 'trendLine');
+      for (const edge of [clipLine(a, add(a, dir), env.plot, 0, UNBOUNDED), clipLine(b, add(b, dir), env.plot, 0, UNBOUNDED)]) {
+        if (edge) out.push(segment(edge[0], edge[1], trend.color, trend.width, trend.dash));
+      }
+      return out;
+    },
+  },
+  {
+    id: 'FibChannel',
+    label: 'Fib Channel',
+    group: 'gannFib',
+    sectionKey: 'fibonacci',
+    anchorCount: 3,
+    anchorAxes: ['xy', 'xy', 'xy'],
+    glyph: 'ϕ‖',
+    hint: 'Click one trend line, the other, then where the channel runs out',
+    styleKeys: CHANNEL_STYLE_KEYS,
+    styleDefaults: {
+      fillBackground: true,
+      backgroundOpacity: 10,
+      showLabels: true,
+      showPrices: true,
+      levelFormat: 'value',
+      textPosition: 'left',
+      trendLineColor: '#B0B0B0',
+      trendLineLineStyle: 'dashed',
+      fibLevels: FIB_CHANNEL_LEVELS,
+    },
+    primitives: (anchors, style, env) => {
+      const a = anchors[0];
+      const c = anchors[2];
+      if (!a || !c) return [];
+      return channelPrimitives(anchors, style, env, styleLevels(style, 'fibLevels'), trendDir(a, c, env.plot), { extend: true, median: false });
+    },
+  },
+  {
+    id: 'Pitchfan',
+    label: 'Pitchfan',
+    group: 'gannFib',
+    sectionKey: 'fibonacci',
+    anchorCount: 3,
+    anchorAxes: ['xy', 'xy', 'xy'],
+    glyph: '⋔',
+    hint: 'Click the two extremes, then the handle the fan runs from',
+    styleKeys: [...CHANNEL_STYLE_KEYS, 'medianColor', 'medianLineWidth', 'medianLineStyle', 'extendLines'],
+    styleDefaults: {
+      medianColor: '#F23645',
+      medianLineWidth: 2,
+      medianLineStyle: 'solid',
+      fillBackground: true,
+      backgroundOpacity: 10,
+      showLabels: true,
+      showPrices: true,
+      levelFormat: 'value',
+      textPosition: 'left',
+      extendLines: false,
+      trendLineColor: '#B0B0B0',
+      trendLineLineStyle: 'dashed',
+      fibLevels: PITCHFAN_LEVELS,
+    },
+    primitives: (anchors, style, env) => {
+      const a = anchors[0];
+      const b = anchors[1];
+      const c = anchors[2];
+      if (!a || !b || !c) return [];
+      const dir = trendDir(mid(a, b), c, env.plot);
+      return channelPrimitives(anchors, style, env, styleLevels(style, 'fibLevels'), dir, {
+        extend: styleBoolean(style, 'extendLines', false),
+        median: true,
+      });
+    },
+  },
+  {
+    id: 'FibTimeZone',
+    label: 'Fib Time Zone',
+    group: 'gannFib',
+    sectionKey: 'fibonacci',
+    anchorCount: 2,
+    anchorAxes: ['xy', 'xy'],
+    glyph: 'ϕ⋮',
+    hint: 'Click the swing start, then one bar of the interval; the zones repeat it',
+    styleKeys: [
+      'lineWidth',
+      'lineStyle',
+      'fillBackground',
+      'backgroundOpacity',
+      'showLabels',
+      'trendLineColor',
+      'trendLineLineWidth',
+      'trendLineLineStyle',
+      'fibLevels',
+    ],
+    styleDefaults: {
+      fillBackground: false,
+      backgroundOpacity: 10,
+      showLabels: true,
+      trendLineColor: '#B0B0B0',
+      trendLineLineStyle: 'dashed',
+      trendLineLineWidth: 1,
+      fibLevels: FIB_TIME_LEVELS,
+    },
+    primitives: (anchors, style, env) => {
+      const a = anchors[0];
+      const b = anchors[1];
+      if (!a || !b) return [];
+      const out: Prim[] = [];
+      const period = b.x - a.x;
+      if (Math.abs(period) < 1) return [segment(a, b, styleColor(style, 'trendLineColor', '#B0B0B0'), 1, [6, 4])];
+      const enabled = enabledLevels(styleLevels(style, 'fibLevels'));
+      const pen = levelPen(style);
+      const opacity = styleNumber(style, 'backgroundOpacity', 10);
+      const fill = styleBoolean(style, 'fillBackground', true);
+      const at = (value: number): number => a.x + period * value;
+
+      for (let i = 0; i < enabled.length - 1; i += 1) {
+        const near = enabled[i];
+        const next = enabled[i + 1];
+        if (!near || !next) continue;
+        const left = Math.min(at(near.value), at(next.value));
+        const width = Math.abs(at(next.value) - at(near.value));
+        if (left > env.plot.right || left + width < env.plot.left || !fill) continue;
+        out.push(
+          polygon(
+            [
+              { x: left, y: env.plot.top },
+              { x: left + width, y: env.plot.top },
+              { x: left + width, y: env.plot.bottom },
+              { x: left, y: env.plot.bottom },
+            ],
+            withOpacity(near.color, opacity),
+          ),
+        );
+      }
+      for (const level of enabled) {
+        const x = at(level.value);
+        if (x < env.plot.left || x > env.plot.right) continue;
+        out.push(segment({ x, y: env.plot.top }, { x, y: env.plot.bottom }, level.color, pen.width, pen.dash));
+        if (!styleBoolean(style, 'showLabels', true)) continue;
+        out.push({
+          kind: 'label',
+          at: { x: x + 4, y: env.plot.bottom - 4 },
+          text: `${level.value}`,
+          options: { color: level.color, font: LEVEL_FONT, align: 'left', baseline: 'bottom' },
+          auto: true,
+        });
+      }
+      const trend = stroke(style, 'trendLine');
+      out.push(segment(a, b, trend.color, trend.width, trend.dash));
+      return out;
+    },
+  },
+  {
+    id: 'FibTrendTime',
+    label: 'Fib Trend Time',
+    group: 'gannFib',
+    sectionKey: 'fibonacci',
+    anchorCount: 3,
+    // The third anchor only lends the trend its direction; it never moves a level of its own.
+    anchorAxes: ['xy', 'xy', 'xy'],
+    glyph: 'ϕ⌇',
+    hint: 'Click the swing start, the swing end, then where the trend keeps running',
+    styleKeys: [
+      'lineWidth',
+      'lineStyle',
+      'fillBackground',
+      'backgroundOpacity',
+      'showLabels',
+      'trendLineColor',
+      'trendLineLineWidth',
+      'trendLineLineStyle',
+      'fibLevels',
+    ],
+    styleDefaults: {
+      fillBackground: true,
+      backgroundOpacity: 10,
+      showLabels: true,
+      trendLineColor: '#B0B0B0',
+      trendLineLineStyle: 'dashed',
+      trendLineLineWidth: 1,
+      fibLevels: FIB_TREND_TIME_LEVELS,
+    },
+    primitives: (anchors, style, env) => {
+      const a = anchors[0];
+      const b = anchors[1];
+      const c = anchors[2];
+      if (!a || !b || !c) return [];
+      const out: Prim[] = [];
+      const dir = trendDir(b, c, env.plot);
+      const enabled = enabledLevels(styleLevels(style, 'fibLevels'));
+      const pen = levelPen(style);
+      const opacity = styleNumber(style, 'backgroundOpacity', 10);
+      const fill = styleBoolean(style, 'fillBackground', true);
+
+      const spanAt = (x: number): [number, number] | null => {
+        const top = Math.min(slantedY(a, dir, x), slantedY(b, dir, x));
+        const bottom = Math.max(slantedY(a, dir, x), slantedY(b, dir, x));
+        if (!(bottom > top)) return null;
+        return [Math.max(top, env.plot.top), Math.min(bottom, env.plot.bottom)];
+      };
+
+      for (let i = 0; i < enabled.length - 1; i += 1) {
+        const near = enabled[i];
+        const next = enabled[i + 1];
+        if (!near || !next || !fill) continue;
+        const x1 = a.x + (b.x - a.x) * near.value;
+        const x2 = a.x + (b.x - a.x) * next.value;
+        if (Math.abs(x2 - x1) < 0.5) continue;
+        const left = spanAt(x1);
+        const right = spanAt(x2);
+        if (!left || !right) continue;
+        out.push(
+          polygon(
+            [{ x: x1, y: left[0] }, { x: x2, y: right[0] }, { x: x2, y: right[1] }, { x: x1, y: left[1] }],
+            withOpacity(near.color, opacity),
+          ),
+        );
+      }
+      for (const level of enabled) {
+        const x = a.x + (b.x - a.x) * level.value;
+        const span = spanAt(x);
+        if (!span) continue;
+        out.push(segment({ x, y: span[0] }, { x, y: span[1] }, level.color, pen.width, pen.dash));
+        if (!styleBoolean(style, 'showLabels', true)) continue;
+        out.push({
+          kind: 'label',
+          at: { x: x + 4, y: span[0] + 12 },
+          text: `${level.value}`,
+          options: { color: level.color, font: LEVEL_FONT, align: 'left', baseline: 'top' },
+          auto: true,
+        });
+      }
+      const trend = stroke(style, 'trendLine');
+      for (const edge of [clipLine(a, add(a, dir), env.plot, 0, UNBOUNDED), clipLine(b, add(b, dir), env.plot, 0, UNBOUNDED)]) {
+        if (edge) out.push(segment(edge[0], edge[1], trend.color, trend.width, trend.dash));
+      }
+      return out;
+    },
+  },
+  {
+    id: 'FibSpeedResistanceFan',
+    label: 'Fib Speed Resistance Fan',
+    group: 'gannFib',
+    sectionKey: 'fibonacci',
+    anchorCount: 2,
+    anchorAxes: ['xy', 'xy'],
+    glyph: 'ϕ⋁',
+    hint: 'Drag the box the fan is cut from',
+    styleKeys: [
+      'lineWidth',
+      'lineStyle',
+      'reverse',
+      'fillBackground',
+      'backgroundOpacity',
+      'gridVisible',
+      'gridColor',
+      'showLabels',
+      'hLevels',
+      'vLevels',
+    ],
+    styleDefaults: {
+      reverse: false,
+      fillBackground: true,
+      backgroundOpacity: 10,
+      gridVisible: true,
+      gridColor: '#9598A1',
+      showLabels: true,
+      hLevels: QUARTER_LEVELS,
+      vLevels: QUARTER_LEVELS,
+    },
+    primitives: (anchors, style, env) => {
+      const a = anchors[0];
+      const b = anchors[1];
+      if (!a || !b) return [];
+      const frame = rayFrame(a, b, styleBoolean(style, 'reverse', false));
+      const out: Prim[] = [];
+      if (frame.ux === 0 || frame.uy === 0) return [segment(frame.o, frame.t, styleColor(style, 'color', '#9598A1'), 2, [])];
+      const pen = levelPen(style);
+      const opacity = styleNumber(style, 'backgroundOpacity', 10);
+      const fill = styleBoolean(style, 'fillBackground', true);
+
+      const rays = (levels: LevelEntry[], axis: 'h' | 'v') =>
+        enabledLevels(levels)
+          .map((level) => {
+            const dirX = axis === 'h' ? frame.ux : frame.ux * level.value;
+            const dirY = axis === 'h' ? frame.uy * level.value : frame.uy;
+            const end = rayToEnd(frame.o, dirX, dirY, env.plot);
+            return end ? { level, end } : null;
+          })
+          .filter((ray): ray is { level: LevelEntry; end: Pt } => ray !== null);
+
+      for (const axis of ['h', 'v'] as const) {
+        const drawn = rays(axis === 'h' ? styleLevels(style, 'hLevels') : styleLevels(style, 'vLevels'), axis);
+        for (let i = 0; i < drawn.length - 1; i += 1) {
+          const near = drawn[i];
+          const next = drawn[i + 1];
+          if (!near || !next || !fill) continue;
+          out.push(polygon([frame.o, near.end, next.end], withOpacity(near.level.color, opacity)));
+        }
+        for (const ray of drawn) {
+          out.push(segment(frame.o, ray.end, ray.level.color, pen.width, pen.dash));
+          if (!styleBoolean(style, 'showLabels', true)) continue;
+          out.push({
+            kind: 'label',
+            at: { x: ray.end.x + (frame.ux >= 0 ? 4 : -4), y: ray.end.y + (axis === 'h' ? -4 : 4) },
+            text: `${ray.level.value}`,
+            options: {
+              color: ray.level.color,
+              font: LEVEL_FONT,
+              align: frame.ux >= 0 ? 'left' : 'right',
+              baseline: axis === 'h' ? 'bottom' : 'top',
+            },
+            auto: true,
+          });
+        }
+      }
+      if (styleBoolean(style, 'gridVisible', true)) {
+        const grid = styleColor(style, 'gridColor', '#9598A1');
+        for (const level of enabledLevels(styleLevels(style, 'hLevels'))) {
+          const y = frame.o.y + frame.uy * level.value;
+          out.push(segment({ x: env.plot.left, y }, { x: env.plot.right, y }, grid, 1, [2, 3]));
+        }
+        for (const level of enabledLevels(styleLevels(style, 'vLevels'))) {
+          const x = frame.o.x + frame.ux * level.value;
+          out.push(segment({ x, y: env.plot.top }, { x, y: env.plot.bottom }, grid, 1, [2, 3]));
+        }
+      }
+      return out;
+    },
+  },
+  {
+    id: 'FibCircles',
+    label: 'Fibonacci Circles',
+    group: 'gannFib',
+    sectionKey: 'fibonacci',
+    anchorCount: 2,
+    anchorAxes: ['xy', 'xy'],
+    glyph: '◎',
+    hint: 'Click the centre, then any point on the first circle',
+    styleKeys: POLAR_STYLE_KEYS,
+    styleDefaults: POLAR_DEFAULTS,
+    primitives: (anchors, style, env) => {
+      const a = anchors[0];
+      const b = anchors[1];
+      if (!a || !b) return [];
+      return polarPrimitives(anchors, style, env, styleLevels(style, 'fibLevels'), {
+        centre: mid(a, b),
+        unit: Math.hypot(b.x - a.x, b.y - a.y) / 2,
+        from: 0,
+        to: Math.PI * 2,
+        closed: true,
+      });
+    },
+  },
+  {
+    id: 'FibSpeedResistanceArcs',
+    label: 'Fib Speed Resistance Arcs',
+    group: 'gannFib',
+    sectionKey: 'fibonacci',
+    anchorCount: 2,
+    anchorAxes: ['xy', 'xy'],
+    glyph: 'ϕ◠',
+    hint: 'Click the swing, then the point the arcs sweep from',
+    styleKeys: POLAR_STYLE_KEYS,
+    styleDefaults: POLAR_DEFAULTS,
+    primitives: (anchors, style, env) => {
+      const a = anchors[0];
+      const b = anchors[1];
+      if (!a || !b) return [];
+      const angle = Math.atan2(a.y - b.y, a.x - b.x);
+      return polarPrimitives(anchors, style, env, styleLevels(style, 'fibLevels'), {
+        centre: b,
+        unit: Math.hypot(b.x - a.x, b.y - a.y),
+        from: angle - Math.PI / 2,
+        to: angle + Math.PI / 2,
+        closed: false,
+      });
+    },
+  },
+  {
+    id: 'FibWedge',
+    label: 'Fibonacci Wedge',
+    group: 'gannFib',
+    sectionKey: 'fibonacci',
+    anchorCount: 2,
+    anchorAxes: ['xy', 'xy'],
+    glyph: '◤',
+    hint: 'Click the apex, then the corner the wedge opens to',
+    styleKeys: POLAR_STYLE_KEYS,
+    styleDefaults: POLAR_DEFAULTS,
+    primitives: (anchors, style, env) => {
+      const a = anchors[0];
+      const b = anchors[1];
+      if (!a || !b) return [];
+      const angle = Math.atan2(b.y - a.y, b.x - a.x);
+      const out = polarPrimitives(anchors, style, env, styleLevels(style, 'fibLevels'), {
+        centre: a,
+        unit: Math.hypot(b.x - a.x, b.y - a.y),
+        from: angle - Math.PI / 4,
+        to: angle + Math.PI / 4,
+        closed: false,
+      });
+      const pen = levelPen(style);
+      for (const edge of [angle - Math.PI / 4, angle + Math.PI / 4]) {
+        out.push(segment(a, polar(a, edge, Math.hypot(b.x - a.x, b.y - a.y)), styleColor(style, 'color'), pen.width, pen.dash));
+      }
+      return out;
+    },
+  },
+  {
+    id: 'FibSpiral',
+    label: 'Fibonacci Spiral',
+    group: 'gannFib',
+    sectionKey: 'fibonacci',
+    anchorCount: 2,
+    anchorAxes: ['xy', 'xy'],
+    glyph: '๐',
+    hint: 'Click the eye of the spiral, then where it starts unwinding',
+    styleKeys: ['color', 'lineWidth', 'lineStyle', 'counterclockwise'],
+    styleDefaults: { color: '#4DA3FF', lineWidth: 2, lineStyle: 'solid', counterclockwise: false },
+    primitives: (anchors, style, env) => {
+      const a = anchors[0];
+      const b = anchors[1];
+      if (!a || !b) return [];
+      const reach = Math.hypot(b.x - a.x, b.y - a.y);
+      const pen = levelPen(style);
+      if (!(reach > 1)) return [segment(a, b, styleColor(style, 'color'), pen.width, pen.dash)];
+      const base = Math.atan2(b.y - a.y, b.x - a.x);
+      const turn = Math.PI / 2;
+      const sign = styleBoolean(style, 'counterclockwise', false) ? -1 : 1;
+      const out: Prim[] = [];
+      let previous: Pt | null = null;
+      // One quarter turn multiplies the radius by the golden ratio, which is what makes the
+      // curve a Fibonacci spiral rather than any other growth curve.
+      for (let u = -4 * Math.PI; u <= 3 * Math.PI + 1e-9; u += turn / 12) {
+        const radius = reach * PHI ** (u / turn);
+        const at = polar(a, base + sign * u, radius);
+        if (previous && Math.hypot(at.x - previous.x, at.y - previous.y) < env.plot.right * 4) {
+          out.push(segment(previous, at, styleColor(style, 'color'), pen.width, pen.dash));
+        }
+        previous = at;
+        if (radius > env.plot.right * 8 && at.x < env.plot.left && at.x > env.plot.right) break;
+      }
+      return out;
+    },
+  },
+  {
+    id: 'GannBox',
+    label: 'Gann Box',
+    group: 'gannFib',
+    sectionKey: 'gann',
+    anchorCount: 2,
+    anchorAxes: ['xy', 'xy'],
+    glyph: '⊞',
+    hint: 'Drag the box the Gann levels divide · Shift squares it',
+    shiftConstraint: 'square',
+    styleKeys: [
+      'lineWidth',
+      'lineStyle',
+      'reverse',
+      'fansVisible',
+      'fansColor',
+      'showLabels',
+      'fillBackground',
+      'backgroundOpacity',
+      'hLevels',
+      'vLevels',
+    ],
+    styleDefaults: {
+      lineWidth: 1,
+      reverse: false,
+      fansVisible: false,
+      fansColor: '#9598A1',
+      showLabels: true,
+      fillBackground: true,
+      backgroundOpacity: 20,
+      hLevels: QUARTER_LEVELS,
+      vLevels: QUARTER_LEVELS,
+    },
+    primitives: (anchors, style, _env) => {
+      const a = anchors[0];
+      const b = anchors[1];
+      if (!a || !b) return [];
+      const frame = rayFrame(a, b, styleBoolean(style, 'reverse', false));
+      const out: Prim[] = [];
+      const pen = levelPen(style, 1);
+      const box = {
+        left: Math.min(frame.o.x, frame.t.x),
+        right: Math.max(frame.o.x, frame.t.x),
+        top: Math.min(frame.o.y, frame.t.y),
+        bottom: Math.max(frame.o.y, frame.t.y),
+      };
+      const hLevels = enabledLevels(styleLevels(style, 'hLevels'));
+      const vLevels = enabledLevels(styleLevels(style, 'vLevels'));
+      const opacity = styleNumber(style, 'backgroundOpacity', 20);
+      const showLabels = styleBoolean(style, 'showLabels', true);
+
+      if (frame.ux !== 0 && frame.uy !== 0 && styleBoolean(style, 'fillBackground', true)) {
+        for (let i = 0; i < hLevels.length - 1; i += 1) {
+          const near = hLevels[i];
+          const next = hLevels[i + 1];
+          if (!near || !next) continue;
+          const y1 = frame.o.y + frame.uy * near.value;
+          const y2 = frame.o.y + frame.uy * next.value;
+          out.push(
+            polygon(
+              [
+                { x: box.left, y: Math.min(y1, y2) },
+                { x: box.right, y: Math.min(y1, y2) },
+                { x: box.right, y: Math.max(y1, y2) },
+                { x: box.left, y: Math.max(y1, y2) },
+              ],
+              withOpacity(near.color, opacity),
+            ),
+          );
+        }
+      }
+      for (const level of hLevels) {
+        const y = frame.o.y + frame.uy * level.value;
+        out.push(segment({ x: box.left, y }, { x: box.right, y }, level.color, pen.width, pen.dash));
+        if (showLabels) {
+          out.push({
+            kind: 'label',
+            at: { x: box.left + 4, y: y - 3 },
+            text: `${level.value}`,
+            options: { color: level.color, font: LEVEL_FONT, align: 'left', baseline: 'bottom' },
+            auto: true,
+          });
+        }
+      }
+      for (const level of vLevels) {
+        const x = frame.o.x + frame.ux * level.value;
+        out.push(segment({ x, y: box.top }, { x, y: box.bottom }, level.color, pen.width, pen.dash));
+        if (showLabels) {
+          out.push({
+            kind: 'label',
+            at: { x: x + 3, y: box.bottom - 4 },
+            text: `${level.value}`,
+            options: { color: level.color, font: LEVEL_FONT, align: 'left', baseline: 'bottom' },
+            auto: true,
+          });
+        }
+      }
+      if (styleBoolean(style, 'fansVisible', false) && frame.ux !== 0 && frame.uy !== 0) {
+        const fan = styleColor(style, 'fansColor', '#9598A1');
+        for (const level of hLevels) {
+          if (level.value === 0) continue;
+          out.push(segment(frame.o, { x: frame.t.x, y: frame.o.y + frame.uy * level.value }, fan, pen.width, pen.dash));
+        }
+        for (const level of vLevels) {
+          if (level.value === 0) continue;
+          out.push(segment(frame.o, { x: frame.o.x + frame.ux * level.value, y: frame.t.y }, fan, pen.width, pen.dash));
+        }
+      }
+      return out;
+    },
+  },
+  {
+    id: 'GannSquare',
+    label: 'Gann Square',
+    group: 'gannFib',
+    sectionKey: 'gann',
+    anchorCount: 2,
+    anchorAxes: ['xy', 'xy'],
+    glyph: '⧉',
+    hint: 'Drag the corner of the square of nine',
+    styleKeys: ['lineWidth', 'lineStyle', 'reverse', 'showText', 'showLabels', 'hLevels', 'vLevels', 'arcs', 'fans'],
+    styleDefaults: {
+      lineWidth: 1,
+      reverse: false,
+      showText: true,
+      showLabels: true,
+      hLevels: GANN_SQUARE_LEVELS,
+      vLevels: GANN_SQUARE_LEVELS,
+      arcs: GANN_SQUARE_ARCS,
+      fans: GANN_SQUARE_FANS,
+    },
+    primitives: (anchors, style, env) => gannSquarePrimitives(anchors, style, env, false),
+  },
+  {
+    id: 'GannSquareFixed',
+    label: 'Gann Square Fixed',
+    group: 'gannFib',
+    sectionKey: 'gann',
+    anchorCount: 2,
+    anchorAxes: ['xy', 'xy'],
+    glyph: '⧈',
+    hint: 'Drag the corner of the fixed square · Shift squares it',
+    shiftConstraint: 'square',
+    styleKeys: ['lineWidth', 'lineStyle', 'reverse', 'showText', 'showLabels', 'hLevels', 'vLevels', 'arcs', 'fans'],
+    styleDefaults: {
+      lineWidth: 1,
+      reverse: false,
+      showText: true,
+      showLabels: true,
+      hLevels: GANN_SQUARE_LEVELS,
+      vLevels: GANN_SQUARE_LEVELS,
+      arcs: GANN_SQUARE_ARCS,
+      fans: GANN_SQUARE_FANS,
+    },
+    primitives: (anchors, style, env) => gannSquarePrimitives(anchors, style, env, true),
+  },
+  {
+    id: 'GannFan',
+    label: 'Gann Fan',
+    group: 'gannFib',
+    sectionKey: 'gann',
+    anchorCount: 2,
+    anchorAxes: ['xy', 'xy'],
+    glyph: '⌃',
+    hint: 'Drag from the origin along the 1x1 angle',
+    styleKeys: ['lineWidth', 'lineStyle', 'fillBackground', 'backgroundOpacity', 'showLabels', 'gannLevels'],
+    styleDefaults: {
+      lineWidth: 1,
+      fillBackground: true,
+      backgroundOpacity: 10,
+      showLabels: true,
+      gannLevels: GANN_FAN_LEVELS,
+    },
+    primitives: (anchors, style, env) => gannFanPrimitives(anchors, style, env, styleLevels(style, 'gannLevels'), []),
   },
 ];
 
@@ -2239,6 +3386,7 @@ export const DRAWING_TOOLS: readonly DrawingToolDefinition[] = [
   ...PATTERN_TOOLS,
   ...ELLIOTT_TOOLS,
   ...CYCLE_TOOLS,
+  ...GANN_FIB_TOOLS,
   {
     id: 'Signpost',
     label: 'Signpost',
