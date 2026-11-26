@@ -42,6 +42,16 @@ import { SettingsDialog } from './settingsDialog';
 import type { PrintRange } from './settingsDialog';
 import { ShortcutDialog } from './shortcutDialog';
 import { AlertsDialog } from './alertsDialog';
+import { ClusterSearchDialog } from './clusterSearchDialog';
+import { ClusterMarkers } from './panes/clusterMarkers';
+import {
+  barStartFor,
+  clusterSearchNote,
+  clusterSearchState,
+  emptyClusterSearch,
+  type ClusterRequest,
+  type ClusterSearchState,
+} from './clusterSearch';
 import { DesktopNotifier } from './notify';
 import { conditionText, fireValueText, mergeFires, parseAlerts, parseFires } from './alertsModel';
 import type { AlertPayload } from './alertsModel';
@@ -62,6 +72,7 @@ import type {
   AlertFire,
   AlertRecord,
   Bar,
+  ClusterPrint,
   Coverage,
   DepthSnapshot,
   FootprintSeries,
@@ -99,6 +110,11 @@ const STACK_PANES: readonly string[] = ['volume', 'footprint', 'profile', 'sizeB
 const SIZE_PANE_DEBOUNCE_MS = 260;
 const SIZE_PANE_LIVE_REFRESH_MS = 5_000;
 const PRICE_GUTTER_HIT = 4;
+/**
+ * Pages of older candles one cluster-search row may pull to bring its print on screen. A print
+ * older than the stored candles stops here instead of starting an unbounded download.
+ */
+const CLUSTER_HISTORY_PAGES = 24;
 /** Height an indicator pane gets until the user drags its splitter. */
 const INDICATOR_PANE_WEIGHT = 1;
 const INDICATOR_PANE_MIN_PX = 110;
@@ -193,6 +209,12 @@ export class ChartApp {
   private settingsDialog!: SettingsDialog;
   private shortcutDialog!: ShortcutDialog;
   private alertsDialog!: AlertsDialog;
+  private clusterDialog!: ClusterSearchDialog;
+  /** The last cluster search, and the marks it paints on the price pane. */
+  private clusterState: ClusterSearchState = emptyClusterSearch();
+  private readonly clusterMarkers = new ClusterMarkers();
+  /** Bumped per search so a late answer cannot overwrite one the trader asked for later. */
+  private clusterGeneration = 0;
   /** Rules and fires exactly as the server has them: the panel is a view over these. */
   private alertRules: AlertRecord[] = [];
   private alertFires: AlertFire[] = [];
@@ -355,6 +377,33 @@ export class ChartApp {
     });
     this.shortcutDialog = new ShortcutDialog();
 
+    // The cluster search reads the chart for its starting window and hands back the print the
+    // trader clicked. It holds no prints of its own: the answer lives in `clusterState`, which
+    // the list, the price-pane marks and the note all read, so they cannot disagree.
+    this.clusterDialog = new ClusterSearchDialog({
+      prefilled: () => {
+        const window = this.visibleTimeRange();
+        return {
+          instrument: this.instrument?.id ?? DEFAULT_INSTRUMENT,
+          timeframe: this.timeframe,
+          from: window.from,
+          to: window.to,
+          pricePrecision: this.instrument?.pricePrecision ?? 2,
+          qtyPrecision: this.instrument?.qtyPrecision ?? 3,
+        };
+      },
+      timeframes: () => TIMEFRAMES.filter((def) => def.ms !== null).map((def) => def.key),
+      onSearch: (request) => void this.runClusterSearch(request),
+      onPick: (print) => this.focusClusterPrint(print),
+      markers: () => this.clusterMarkers.show,
+      onMarkers: (on) => {
+        this.clusterMarkers.show = on;
+        this.markDirty();
+      },
+      state: () => this.clusterState,
+      time: (ms) => this.local.format(ms, 'dateTime'),
+    });
+
     // Alerts live on the server, so the panel owns none of them: it reads what the API
     // returns and sends whole rules back when the trader changes one.
     this.alertsDialog = new AlertsDialog({
@@ -406,6 +455,7 @@ export class ChartApp {
       onIndicators: () => this.indicatorDialog.toggle(),
       onAlerts: () => this.openAlerts(),
       onFootprintSettings: () => this.footprintDialog.toggle(),
+      onClusters: () => this.clusterDialog.toggle(),
       onSettings: () => this.settingsDialog.toggle(),
       onBackup: () => this.settingsDialog.showPage('backup'),
       onShortcuts: () => this.shortcutDialog.toggle(),
@@ -615,6 +665,24 @@ export class ChartApp {
           muted: fire.muted,
         })),
       }),
+      /** The last cluster search: what it found, what it marked, and what the panel shows. */
+      clusterSearch: () => ({
+        open: this.clusterDialog.isOpen(),
+        state: this.clusterState,
+        note: clusterSearchNote(this.clusterState),
+        panel: this.clusterDialog.debugState(),
+        marks: this.clusterMarkers.debugInfo,
+        bars: this.clusterMarkers.data?.bars.length ?? 0,
+        counts: this.clusterState.series
+          ? {
+              prints: this.clusterState.series.prints,
+              clusters: this.clusterState.series.clusters,
+              returned: this.clusterState.series.returned,
+              limit: this.clusterState.series.limit,
+              truncated: this.clusterState.series.truncated,
+            }
+          : null,
+      }),
       priceTick: () => this.instrument?.priceTick ?? null,
       paneIds: () => this.stack.visibleHosts().map((host) => host.id),
       /** Box the price-pane legend claims, so a check can prove no other text lands in it. */
@@ -795,6 +863,8 @@ export class ChartApp {
     this.sizeBandsPane.reset();
     this.resetFlow();
     this.resetBandFlow();
+    // Marks belong to one instrument's prints, so a chart of another one must not wear them.
+    this.resetClusterSearch();
     this.topbar.setInstrument(this.instrument);
     this.state.instrument = this.instrument.id;
     this.view.restore(this.state.view);
@@ -822,6 +892,8 @@ export class ChartApp {
     this.sizeBandsPane.reset();
     this.resetFlow();
     this.resetBandFlow();
+    // The counts are grouped by interval, so an answer counted in 1m bars cannot mark 5m ones.
+    this.resetClusterSearch();
     if (this.instrument) {
       try {
         await this.series.load(this.instrument.id, key, this.initialBarLimit);
@@ -1635,6 +1707,7 @@ export class ChartApp {
           this.settingsDialog.isOpen() ||
           this.shortcutDialog.isOpen() ||
           this.alertsDialog.isOpen() ||
+          this.clusterDialog.isOpen() ||
           this.drawingMenu.isOpen())
       ) {
         this.search.close();
@@ -1644,6 +1717,7 @@ export class ChartApp {
         this.settingsDialog.close();
         this.shortcutDialog.close();
         this.alertsDialog.close();
+        this.clusterDialog.close();
         this.drawingMenu.close();
         event.preventDefault();
         return;
@@ -1689,7 +1763,8 @@ export class ChartApp {
         this.footprintDialog.isOpen() ||
         this.settingsDialog.isOpen() ||
           this.shortcutDialog.isOpen() ||
-          this.alertsDialog.isOpen()
+          this.alertsDialog.isOpen() ||
+          this.clusterDialog.isOpen()
       )
         return;
       if (event.key === 'Delete' || event.key === 'Backspace') {
@@ -1885,7 +1960,11 @@ export class ChartApp {
       if (host.id === 'price') {
         // Drawings share the price-pane canvas: that canvas is already repainted whole
         // on every dirty frame, so a second canvas would add a repaint without saving one.
-        this.pricePane.draw(host.ctx, frame, this.decor, this.overlays, (layerCtx, _layerFrame, reserved) => {
+        this.pricePane.draw(host.ctx, frame, this.decor, this.overlays, (layerCtx, clusterFrame, reserved) => {
+          // Cluster marks are painted under the drawings and never through the drawing
+          // registry: they are a view of a search answer, not annotations the trader can
+          // select, drag or undo.
+          this.clusterMarkers.draw(layerCtx, clusterFrame);
           const env = this.toolEnv();
           if (env) this.drawingLayer.draw(layerCtx, this.drawings, env, this.drawingController.pendingState(env), reserved);
         });
@@ -2148,6 +2227,82 @@ export class ChartApp {
         if (changed) this.markDirty();
       });
     }, SIZE_PANE_DEBOUNCE_MS);
+  }
+
+  // ---------------------------------------------------------------- cluster search
+
+  /**
+   * Searches the stored prints of the window the form states. The answer is held by the app
+   * rather than the dialog, so the list, the price-pane marks and the note can only ever
+   * describe the same search; a search that fails leaves the marks off rather than showing the
+   * previous window's.
+   */
+  private async runClusterSearch(request: ClusterRequest): Promise<void> {
+    const generation = ++this.clusterGeneration;
+    this.clusterState = emptyClusterSearch(true, null, request);
+    this.clusterMarkers.selected = null;
+    this.clusterMarkers.data = null;
+    this.markDirty();
+    this.clusterDialog.refresh();
+    try {
+      const series = await api.clusterSearch(
+        request.instrument,
+        request.timeframe,
+        { from: request.from, to: request.to },
+        { threshold: request.threshold, unit: request.unit },
+      );
+      if (generation !== this.clusterGeneration) return;
+      this.clusterState = clusterSearchState(series, false, null, request);
+      this.clusterMarkers.data = series;
+    } catch (error) {
+      if (generation !== this.clusterGeneration) return;
+      this.clusterState = clusterSearchState(null, false, errorMessage(error), request);
+      this.clusterMarkers.data = null;
+      this.status.setError(`cluster search failed: ${errorMessage(error)}`);
+    }
+    this.clusterDialog.refresh();
+    this.markDirty();
+  }
+
+  /**
+   * Lands the chart on one listed print: the bar it traded in is selected in the footprint
+   * pane and centred in the view. Candles older than the local window are pulled a page at a
+   * time, bounded, so a print before stored history cannot start an unbounded download.
+   */
+  private focusClusterPrint(print: ClusterPrint): void {
+    this.clusterMarkers.selected = print;
+    this.clusterMarkers.show = true;
+    this.markDirty();
+    void this.revealPrint(print);
+  }
+
+  private async revealPrint(print: ClusterPrint): Promise<void> {
+    const start = barStartFor(print.ts, this.series.barMs);
+    for (let page = 0; page < CLUSTER_HISTORY_PAGES; page += 1) {
+      const oldest = this.series.firstBar();
+      if (!oldest || oldest.start <= start || this.series.olderExhausted) break;
+      if ((await this.series.loadOlder()) === 0) break;
+    }
+    // A hole in the stored candles still has to land somewhere, so the nearest bar after the
+    // print takes the mark rather than the view doing nothing.
+    let index = this.series.indexOfStart(start);
+    if (index < 0) {
+      index = Math.max(0, this.series.bars.findIndex((bar) => bar.start >= start));
+    }
+    if (this.series.size === 0) return;
+    this.view.centreOn(index, this.series.size);
+    this.footprintPane.selectedStart = this.series.bars[index]?.start ?? start;
+    this.state.view = { ...this.state.view, ...this.view.serialize() };
+    this.markDirty();
+    this.persist();
+  }
+
+  /** Drops the answer and its marks: another symbol or interval invalidates both. */
+  private resetClusterSearch(): void {
+    this.clusterGeneration += 1;
+    this.clusterState = emptyClusterSearch();
+    this.clusterMarkers.clear();
+    this.clusterDialog.refresh();
   }
 
   private resetFlow(): void {

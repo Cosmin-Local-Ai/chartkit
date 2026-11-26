@@ -1735,3 +1735,29 @@ input {
 .feed-check{color:var(--muted);font-family:var(--mono);font-size:11px}
 .st-server[data-phase=delayed]{color:var(--live)}
 .st-server[data-phase=idle]{color:var(--muted)}
+
+/* Cluster search: a right-hand panel, so the chart stays visible while the list is read. */
+.dialog-backdrop.is-side{background:rgba(6,9,12,.34);justify-content:flex-end;align-items:stretch;padding:12px}
+.dialog-clusters{width:min(560px,100%);max-height:calc(100vh - 24px)}
+.cs-form{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding:10px 12px;border-bottom:1px solid var(--border);display:grid}
+.cs-field{flex-direction:column;gap:4px;display:flex}
+.cs-field .dialog-input,.cs-field .dialog-select{width:100%;font-size:12px}
+.cs-field .dialog-accept{width:100%;padding:8px}
+.cs-filters{align-items:center;gap:6px;padding:8px 12px;border-bottom:1px solid var(--border);display:flex}
+.cs-side{background:var(--panel-2);border:1px solid var(--border);border-radius:4px;color:var(--muted);font-family:var(--mono);font-size:11px;padding:5px 9px;cursor:pointer}
+.cs-side:hover{color:var(--text)}
+.cs-side.is-on{color:var(--text);border-color:var(--accent);background:var(--bg)}
+.cs-text{flex:1;min-width:80px;font-size:11px}
+.cs-marks{color:var(--muted);font-family:var(--mono);font-size:11px;align-items:center;gap:5px;display:flex}
+.cs-head,.cs-row{grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) minmax(0,.8fr) minmax(0,.9fr) 46px;gap:8px;align-items:center;padding:5px 12px;display:grid}
+.cs-head{border-bottom:1px solid var(--border);color:var(--muted);font-size:10px;letter-spacing:.06em;text-transform:uppercase}
+.cs-results{overflow-y:auto;flex:1;min-height:120px}
+.cs-row{border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px;cursor:pointer}
+.cs-row:hover,.cs-row:focus-visible{background:var(--panel-2);outline:none}
+.cs-row.is-picked{background:var(--bg);border-left:2px solid var(--live);padding-left:10px}
+.cs-cell{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cs-notional,.cs-size,.cs-aggressor{text-align:right}
+.cs-aggressor.is-buy{color:var(--up)}
+.cs-aggressor.is-sell{color:var(--down)}
+.cs-note{border-top:1px solid var(--border);color:var(--muted);font-size:11px;padding:8px 12px}
+.cs-note.is-error{color:var(--down)}

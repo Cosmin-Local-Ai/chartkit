@@ -19,6 +19,8 @@ export interface TopbarHandlers {
   /** The alerts panel: rules the server judges, and what they fired. */
   onAlerts: () => void;
   onFootprintSettings: () => void;
+  /** Cluster search: the prints at or above a size, in a window. */
+  onClusters: () => void;
   onSettings: () => void;
   /** Opens settings straight on the backup page: the export button a trader reaches for. */
   onBackup: () => void;
@@ -84,6 +86,9 @@ export class Topbar {
       // The Panes group already has a "Footprint" on/off toggle, so the settings entry
       // point spells itself out differently.
       actionButton('Footprint settings', 'Configure the footprint pane', () => handlers.onFootprintSettings()),
+      actionButton('Clusters', 'Search the stored prints for the ones at or above a size', () =>
+        handlers.onClusters(),
+      ),
       actionButton('Settings', 'Appearance, chart data, timezone, latency, templates', () => handlers.onSettings()),
       // Backup is a deliberate, occasional action, so it gets its own button rather than a
       // line inside Settings; it opens the settings page rather than a dialog of its own.

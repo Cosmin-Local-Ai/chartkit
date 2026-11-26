@@ -161,6 +161,63 @@ export interface SizeBandSeries {
   delta: number;
 }
 
+/**
+ * One print at or above the cluster threshold. `notional` is the number the server filtered
+ * on, sent rather than rebuilt by the client.
+ */
+export interface ClusterPrint {
+  ts: number;
+  /** Venue sequence: the print's other key, so a row can be found again in the store. */
+  seq: number;
+  price: number;
+  qty: number;
+  notional: number;
+  aggressor: 'buy' | 'sell';
+}
+
+/**
+ * How many of one bar's prints cleared the threshold. `notional / qty` is the volume-weighted
+ * price of exactly those prints, which is where the bar's cluster is marked.
+ */
+export interface ClusterBar {
+  start: number;
+  prints: number;
+  buyN: number;
+  sellN: number;
+  qty: number;
+  notional: number;
+}
+
+/**
+ * Prints at or above one size, newest first. The counts describe the whole window; `rows` is
+ * the newest `limit` of them, and `truncated` says when those are not the same set. `prints`
+ * counts every print the window holds, so 0 means the window holds no prints at all rather
+ * than that nothing in it was big enough.
+ */
+export interface ClusterSearchSeries {
+  instrument: string;
+  timeframe: string;
+  from: number | null;
+  to: number | null;
+  sizeUnit: SizeUnit;
+  /** The threshold and its measure, in words the UI prints rather than infers. */
+  sizeRule: string;
+  threshold: number;
+  prints: number;
+  clusters: number;
+  returned: number;
+  /** The cap the server applied to the list. */
+  limit: number;
+  truncated: boolean;
+  clusterQty: number;
+  clusterNotional: number;
+  buyN: number;
+  sellN: number;
+  rows: ClusterPrint[];
+  /** Bars holding at least one cluster print, oldest first. */
+  bars: ClusterBar[];
+}
+
 export interface Coverage {
   bars: number;
   instruments: number;

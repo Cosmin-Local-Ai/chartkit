@@ -46,6 +46,22 @@ pub struct SizeBandRow {
     pub sell_n: i64,
 }
 
+/// One bar of a cluster search: every print the bar holds, and the part of it at or above
+/// the threshold. Keeping both is what lets a caller tell "this window holds no prints"
+/// apart from "nothing in it was big enough". `group` is a bar start in milliseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ClusterBarRow {
+    pub group: i64,
+    /// Prints in the bar, whatever their size.
+    pub prints: i64,
+    /// Prints at or above the threshold.
+    pub hits: i64,
+    pub hit_qty: f64,
+    pub hit_notional: f64,
+    pub hit_buy_n: i64,
+    pub hit_sell_n: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -698,15 +714,77 @@ impl Db {
         self.size_band_rows(&sql, instrument, from, to, edges, &grid)
     }
 
+    /// Prints at or above `threshold`, newest first, at most `limit` of them. The filter
+    /// runs in SQL over the same `(instrument, ts, seq)` seek the size-band aggregations
+    /// use, so a wide window costs a scan of the window rather than a copy of it, and
+    /// `limit` only bounds the rows that leave the store — `cluster_bars` reports how many
+    /// the window really held.
+    ///
+    /// `unit` decides what `threshold` measures, and it is the same measure the size bands
+    /// band by: quote notional, or base quantity.
+    pub fn cluster_prints(
+        &self,
+        instrument: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        threshold: f64,
+        unit: SizeUnit,
+        limit: i64,
+    ) -> Result<Vec<Trade>, StoreError> {
+        let sql = format!(
+            "SELECT ts, seq, price, qty, aggressor FROM trades
+              WHERE instrument_id = ?1 AND ts >= ?2 AND ts < ?3 AND {size} >= ?4
+              ORDER BY ts DESC, seq DESC LIMIT ?5",
+            size = size_expr(unit),
+        );
+        let guard = self.lock()?;
+        let (oldest, newest) = window_bounds(from, to);
+        let mut stmt = guard.prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            params![instrument, oldest, newest, threshold, limit.max(1)],
+            read_trade,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The same search counted per bar instead of listed: every print each bar holds, and
+    /// the part of it at or above the threshold. One scan answers both, so the caller can
+    /// state the true total and mark the bars without a second pass over the window.
+    ///
+    /// The threshold test is `>=`, which is the rule the top size band already applies: a
+    /// print exactly on a band edge belongs to the band above it. Asking for the bands of a
+    /// ladder whose last edge is the threshold therefore counts the same prints this does.
+    pub fn cluster_bars(
+        &self,
+        instrument: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        threshold: f64,
+        unit: SizeUnit,
+        bar_ms: i64,
+    ) -> Result<Vec<ClusterBarRow>, StoreError> {
+        let size = size_expr(unit);
+        let sql = format!(
+            "SELECT (ts / ?2) * ?2 AS bar,
+                    COUNT(*),
+                    SUM(CASE WHEN {size} >= ?1 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN {size} >= ?1 THEN qty ELSE 0.0 END),
+                    SUM(CASE WHEN {size} >= ?1 THEN qty * price ELSE 0.0 END),
+                    SUM(CASE WHEN {size} >= ?1 AND aggressor = 'buy' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN {size} >= ?1 AND aggressor = 'sell' THEN 1 ELSE 0 END)
+               FROM trades
+              WHERE instrument_id = ?3
+                AND ts >= ?4 AND ts < ?5
+              GROUP BY bar
+              ORDER BY bar"
+        );
+        let rows = self.print_rows(&sql, instrument, from, to, &[threshold], &[&bar_ms], read_cluster_bar_row)?;
+        Ok(rows)
+    }
+
     /// Runs one size-band aggregation. The band edges are compared in the `CASE` in the
     /// order they arrive, so they bind as the first parameters of the statement and every
     /// other argument follows them.
-    ///
-    /// The window is written as a plain `ts >= ? AND ts < ?` rather than the
-    /// `(? IS NULL OR ts >= ?)` the streamed print reads use: SQLite will not fold a guard
-    /// like that into an index seek, and the aggregation would then walk every print the
-    /// instrument holds instead of only the window. An absent bound becomes the end of the
-    /// time range, which the same seek covers.
     fn size_band_rows(
         &self,
         sql: &str,
@@ -716,16 +794,38 @@ impl Db {
         edges: &[f64],
         extra: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<SizeBandRow>, StoreError> {
+        self.print_rows(sql, instrument, from, to, edges, extra, read_size_band_row)
+    }
+
+    /// Runs one window aggregation over the trades table and reads it back with `read`.
+    /// Arguments bind by position: the `edges` first, because the band `CASE` tests them in
+    /// the order they arrive, then the grouping arguments, then the window itself.
+    ///
+    /// The window is written as a plain `ts >= ? AND ts < ?` rather than the
+    /// `(? IS NULL OR ts >= ?)` the streamed print reads use: SQLite will not fold a guard
+    /// like that into an index seek, and the aggregation would then walk every print the
+    /// instrument holds instead of only the window. An absent bound becomes the end of the
+    /// time range, which the same seek covers.
+    fn print_rows<T>(
+        &self,
+        sql: &str,
+        instrument: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        edges: &[f64],
+        extra: &[&dyn rusqlite::ToSql],
+        read: fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>, StoreError> {
         let guard = self.lock()?;
         let mut stmt = guard.prepare_cached(sql)?;
-        let (oldest, newest) = (from.unwrap_or(i64::MIN), to.unwrap_or(i64::MAX));
+        let (oldest, newest) = window_bounds(from, to);
         let mut args: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(edges.len() + extra.len() + 3);
         args.extend(edges.iter().map(|edge| edge as &dyn rusqlite::ToSql));
         args.extend(extra.iter().copied());
         args.push(&instrument);
         args.push(&oldest);
         args.push(&newest);
-        let rows = stmt.query_map(args.as_slice(), read_size_band_row)?;
+        let rows = stmt.query_map(args.as_slice(), read)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -779,6 +879,40 @@ impl Db {
                 &mut stmt,
                 rusqlite::params![1_000.0, 10_000.0, 100_000.0, 60_000i64, "BINANCE:BTCUSDT", 0i64, 1i64],
             )?);
+        }
+        Ok(plans.join(" || "))
+    }
+
+    /// The plans of the cluster search's two reads, joined. A test hook, for the same
+    /// reason as the size-band plans: a threshold filter that cannot ride the
+    /// `(instrument, ts, seq)` seek turns a search into a walk of the whole table.
+    #[cfg(test)]
+    fn cluster_plans(&self) -> Result<String, StoreError> {
+        let guard = self.lock()?;
+        let mut plans: Vec<String> = Vec::new();
+        for unit in [SizeUnit::Notional, SizeUnit::Quantity] {
+            let size = size_expr(unit);
+            let listed = format!(
+                "EXPLAIN QUERY PLAN SELECT ts, seq, price, qty, aggressor FROM trades
+                  WHERE instrument_id = ?1 AND ts >= ?2 AND ts < ?3 AND {size} >= ?4
+                  ORDER BY ts DESC, seq DESC LIMIT ?5"
+            );
+            let counted = format!(
+                "EXPLAIN QUERY PLAN SELECT (ts / ?2) * ?2 AS bar, COUNT(*),
+                        SUM(CASE WHEN {size} >= ?1 THEN 1 ELSE 0 END)
+                   FROM trades
+                  WHERE instrument_id = ?3 AND ts >= ?4 AND ts < ?5
+                  GROUP BY bar ORDER BY bar"
+            );
+            let args: Vec<Vec<&dyn rusqlite::ToSql>> = vec![
+                vec![&"BINANCE:BTCUSDT", &0i64, &1i64, &5_000.0f64, &10i64],
+                vec![&5_000.0f64, &60_000i64, &"BINANCE:BTCUSDT", &0i64, &1i64],
+            ];
+            for (sql, args) in [listed, counted].into_iter().zip(args) {
+                let mut stmt = guard.prepare_cached(&sql)?;
+                plans.push(read_plan(&mut stmt, args.as_slice())?);
+                drop(stmt);
+            }
         }
         Ok(plans.join(" || "))
     }
@@ -1431,6 +1565,26 @@ fn band_case_expr(edges: &[f64], size: &str) -> String {
     }
     sql.push_str(&format!(" ELSE {} END", edges.len()));
     sql
+}
+
+/// Window bounds as SQL arguments. An absent bound becomes the end of the time range, which
+/// is what the `(instrument, ts, seq)` seek covers either way.
+fn window_bounds(from: Option<i64>, to: Option<i64>) -> (i64, i64) {
+    (from.unwrap_or(i64::MIN), to.unwrap_or(i64::MAX))
+}
+
+/// Reads one cluster-search count row: the bar, what it holds, and the part of it that
+/// cleared the threshold.
+fn read_cluster_bar_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClusterBarRow> {
+    Ok(ClusterBarRow {
+        group: row.get(0)?,
+        prints: row.get(1)?,
+        hits: row.get(2)?,
+        hit_qty: row.get(3)?,
+        hit_notional: row.get(4)?,
+        hit_buy_n: row.get(5)?,
+        hit_sell_n: row.get(6)?,
+    })
 }
 
 /// Reads one aggregated size-band row. The grouping column is a bar start or a tick
@@ -2304,6 +2458,199 @@ mod tests {
             assert!(
                 plan.contains("SEARCH trades USING PRIMARY KEY") && plan.contains("ts>") && plan.contains("ts<"),
                 "the aggregation does not seek the (instrument, ts, seq) key by window: {plan}"
+            );
+            assert!(!plan.contains("SCAN trades"), "plan walks every print: {plan}");
+        }
+    }
+
+    /// Prints spread over three minutes with deliberate ties on `ts`, so the order a
+    /// threshold query answers in is tested rather than assumed. Prices and quantities are
+    /// dyadic rationals, so a size compared against a threshold is exact.
+    fn searchable_prints() -> Vec<Trade> {
+        const QTYS: [f64; 8] = [0.5, 4.0, 5.0, 8.0, 16.0, 0.25, 50.0, 1.0];
+        let mut prints = Vec::new();
+        let mut seq = 1u64;
+        for minute in 0..3i64 {
+            for (slot, qty) in QTYS.iter().enumerate() {
+                prints.push(Trade {
+                    // Two prints share every timestamp: the pair the slot index halves.
+                    ts: minute * 60_000 + (slot as i64 / 2) * 1_000,
+                    seq,
+                    price: 100.0 + (slot as f64 % 4.0) * 0.5,
+                    qty: *qty,
+                    aggressor: if slot % 2 == 0 { Side::Buy } else { Side::Sell },
+                });
+                seq += 1;
+            }
+        }
+        prints
+    }
+
+    /// The same search done in plain Rust, without SQL: keep the prints of the window whose
+    /// size clears the threshold, newest first, then cap. The yardstick for the query, so it
+    /// has to be written independently of it.
+    fn scan(
+        prints: &[Trade],
+        from: Option<i64>,
+        to: Option<i64>,
+        threshold: f64,
+        unit: SizeUnit,
+        limit: usize,
+    ) -> Vec<Trade> {
+        let size = |print: &Trade| match unit {
+            SizeUnit::Notional => print.qty * print.price,
+            SizeUnit::Quantity => print.qty,
+        };
+        let mut hits: Vec<Trade> = prints
+            .iter()
+            .filter(|print| {
+                let inside = from.is_none_or(|start| print.ts >= start) && to.is_none_or(|end| print.ts < end);
+                inside && size(print) >= threshold
+            })
+            .copied()
+            .collect();
+        hits.sort_by(|a, b| b.ts.cmp(&a.ts).then(b.seq.cmp(&a.seq)));
+        hits.truncate(limit);
+        hits
+    }
+
+    #[test]
+    fn a_threshold_query_answers_the_same_rows_as_a_plain_rust_scan() {
+        let db = Db::in_memory().expect("in-memory store");
+        let prints = searchable_prints();
+        db.record_trades(ID, &prints).expect("prints");
+
+        let windows = [
+            (None, None, 200i64),
+            (Some(60_000), Some(180_000), 200),
+            (Some(60_000), Some(180_000), 2),
+            (None, None, 1),
+            (Some(0), Some(1_000), 50),
+            (Some(1_000), Some(1_001), 50),
+        ];
+        for unit in [SizeUnit::Notional, SizeUnit::Quantity] {
+            for threshold in [1.0, 100.0, 500.0, 5_000.0, 5_100.0, 25_000.0] {
+                for (from, to, limit) in windows {
+                    let want = scan(&prints, from, to, threshold, unit, limit as usize);
+                    let got = db
+                        .cluster_prints(ID, from, to, threshold, unit, limit)
+                        .expect("threshold query");
+                    assert_eq!(
+                        got,
+                        want,
+                        "{unit:?} at {threshold} over {from:?}..{to:?} limit {limit} answers different rows, in a different order, or a different count"
+                    );
+                    // A cap that bites still answers with the newest prints, never an
+                    // arbitrary slice of them.
+                    let uncapped = scan(&prints, from, to, threshold, unit, usize::MAX);
+                    assert_eq!(
+                        got.len(),
+                        uncapped.len().min(limit as usize),
+                        "the cap changed how many prints the query found"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_print_exactly_on_the_threshold_is_listed_and_counted() {
+        let db = Db::in_memory().expect("in-memory store");
+        // 100.0 x 5.0 is 500.0 exactly, the threshold; 4.99 x 100.0 falls just under it.
+        let prints = [
+            Trade { ts: 1_000, seq: 1, price: 100.0, qty: 5.0, aggressor: Side::Buy },
+            Trade { ts: 2_000, seq: 2, price: 100.0, qty: 4.99, aggressor: Side::Sell },
+            Trade { ts: 3_000, seq: 3, price: 100.0, qty: 5.01, aggressor: Side::Buy },
+        ];
+        db.record_trades(ID, &prints).expect("prints");
+
+        let rows = db
+            .cluster_prints(ID, None, None, 500.0, SizeUnit::Notional, 10)
+            .expect("threshold query");
+        assert_eq!(rows.iter().map(|p| p.ts).collect::<Vec<_>>(), vec![3_000, 1_000], "the print standing on the threshold was left out");
+        let bars = db
+            .cluster_bars(ID, None, None, 500.0, SizeUnit::Notional, 60_000)
+            .expect("per-bar counts");
+        assert_eq!(bars.len(), 1);
+        assert_eq!((bars[0].prints, bars[0].hits), (3, 2), "the counts disagree with the list about the print on the threshold");
+    }
+
+    #[test]
+    fn cluster_counts_per_bar_add_up_to_the_same_windows_band_counts() {
+        let db = Db::in_memory().expect("in-memory store");
+        let prints = banded_prints();
+        db.record_trades(ID, &prints).expect("prints");
+
+        // A ladder whose last edge is the threshold: its top band is `[threshold, )`, which
+        // is the same test the threshold query applies, so the two must count the same
+        // prints bar for bar.
+        let threshold = 5_000.0;
+        let edges = [500.0, threshold];
+        for unit in [SizeUnit::Notional, SizeUnit::Quantity] {
+            let bands = db
+                .size_band_bars(ID, None, None, &edges, unit, 60_000)
+                .expect("band aggregation");
+            let clusters = db
+                .cluster_bars(ID, None, None, threshold, unit, 60_000)
+                .expect("cluster counts");
+
+            assert_eq!(
+                clusters.iter().map(|row| row.group).collect::<Vec<_>>(),
+                bands
+                    .iter()
+                    .map(|row| row.group)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "the counts cover a different set of bars than the bands, in {unit:?}"
+            );
+            for row in &clusters {
+                let top = bands
+                    .iter()
+                    .find(|band| band.group == row.group && band.band == edges.len() as i64)
+                    .copied()
+                    .unwrap_or_default();
+                assert_eq!(row.hits, top.buy_n + top.sell_n, "bar {} counts different cluster prints than the top band, in {unit:?}", row.group);
+                assert_eq!(row.hit_buy_n, top.buy_n, "bar {} splits them differently, in {unit:?}", row.group);
+                assert_eq!(row.hit_sell_n, top.sell_n, "bar {} splits them differently, in {unit:?}", row.group);
+                assert_eq!(row.hit_qty, top.buy_qty + top.sell_qty, "bar {} weighs them differently, in {unit:?}", row.group);
+
+                // Every print of the bar, big or small: the bands together are the whole bar.
+                let all = bands.iter().filter(|band| band.group == row.group).fold(SizeBandRow::default(), |mut acc, band| {
+                    acc.buy_qty += band.buy_qty;
+                    acc.sell_qty += band.sell_qty;
+                    acc.buy_n += band.buy_n;
+                    acc.sell_n += band.sell_n;
+                    acc
+                });
+                assert_eq!(row.prints, all.buy_n + all.sell_n, "bar {} reports a different number of prints than the bands, in {unit:?}", row.group);
+                assert!(row.hits <= row.prints, "a bar counted more clusters than prints, in {unit:?}");
+            }
+
+            // Window totals, and the list of rows the same search returns.
+            let listed = db
+                .cluster_prints(ID, None, None, threshold, unit, 10_000)
+                .expect("threshold query");
+            let hits: i64 = clusters.iter().map(|row| row.hits).sum();
+            let top_band: i64 = bands
+                .iter()
+                .filter(|band| band.band == edges.len() as i64)
+                .map(|band| band.buy_n + band.sell_n)
+                .sum();
+            assert_eq!(hits, top_band, "the window's cluster count is not the window's top band, in {unit:?}");
+            assert_eq!(listed.len() as i64, hits, "the list and the counts found different numbers of prints, in {unit:?}");
+            let prints: i64 = clusters.iter().map(|row| row.prints).sum();
+            assert_eq!(prints, bands.iter().map(|row| row.buy_n + row.sell_n).sum::<i64>(), "the window's print total is not the bands', in {unit:?}");
+        }
+    }
+
+    #[test]
+    fn a_threshold_search_walks_the_print_index_and_not_the_table() {
+        let plans = Db::in_memory().expect("in-memory store").cluster_plans().expect("plans");
+        for plan in plans.split(" || ") {
+            assert!(
+                plan.contains("SEARCH trades USING PRIMARY KEY") && plan.contains("ts>") && plan.contains("ts<"),
+                "the threshold search does not seek the (instrument, ts, seq) key by window: {plan}"
             );
             assert!(!plan.contains("SCAN trades"), "plan walks every print: {plan}");
         }

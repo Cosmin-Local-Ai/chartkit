@@ -3,6 +3,6 @@
 mod db;
 
 pub use db::{
-    BackfillPage, BarFilter, Db, PrintCoverage, PrintSource, PrintSpan, SizeBandRow, StoreError,
-    Workspace,
+    BackfillPage, BarFilter, ClusterBarRow, Db, PrintCoverage, PrintSource, PrintSpan,
+    SizeBandRow, StoreError, Workspace,
 };

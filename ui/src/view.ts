@@ -20,6 +20,11 @@ export const DENSITY_FLOOR_MAX = 12;
 export const DEFAULT_VISIBLE_BARS = 250;
 /** Bars of blank tape kept right of the newest bar at rest, and the pan-right limit. */
 export const HOME_OFFSET = 6;
+/**
+ * How much a single centring request may widen the zoom. Centring a print near the newest bar
+ * needs room the pan limit only allows at a wide step; this keeps that step from running away.
+ */
+const CENTRE_ZOOM_STEP_CAP = 4;
 const DEFAULT_PLOT_WIDTH = 800;
 
 /**
@@ -130,6 +135,30 @@ export class ChartView {
     this.plotWidth = plotWidth;
     this.barStep = clamp(plotWidth / this.defaultVisibleBars, this.minBarStep, MAX_BAR_STEP);
     this.offsetFromEnd = HOME_OFFSET;
+    this.clamp(count);
+  }
+
+  /**
+   * Put bar `index` in the middle of the plot, widening the zoom if it has to. Used by cluster
+   * search: a listed print is only useful if the chart shows it.
+   *
+   * The pan limit allows at most `HOME_OFFSET` bars of blank tape right of the newest bar, so
+   * a print near the newest end cannot be centred at every zoom: the bars between it and the
+   * newest bar have to fill half the plot. Rather than leave it parked at the right edge the
+   * step is widened to whatever still fits, but only by `CENTRE_ZOOM_STEP_CAP`: a click should
+   * not turn a chart of a hundred bars into a chart of eight. Past that bound the print sits as
+   * close to the middle as the pan limit allows, which for the newest bar is its right edge.
+   */
+  centreOn(index: number, count: number): void {
+    if (count < 1 || index < 0 || index >= count) return;
+    const bars = count - 1 - index;
+    const half = this.plotWidth / 2;
+    const room = HOME_OFFSET + bars;
+    if (room > 0 && half / Math.max(0.05, this.barStep) > room) {
+      const widest = Math.min(MAX_BAR_STEP, this.barStep * CENTRE_ZOOM_STEP_CAP);
+      this.barStep = clamp(half / room, this.minBarStep, Math.max(this.minBarStep, widest));
+    }
+    this.offsetFromEnd = half / Math.max(0.05, this.barStep) - bars;
     this.clamp(count);
   }
 

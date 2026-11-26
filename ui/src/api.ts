@@ -4,6 +4,7 @@ import type {
   Bar,
   Coverage,
   FootprintSeries,
+  ClusterSearchSeries,
   Instrument,
   InstrumentSummary,
   SizeBandSeries,
@@ -125,6 +126,22 @@ export const api = {
     window: BarWindow,
     options: { view?: 'bars' | 'levels' | 'both'; bands?: string; unit?: string; ticks?: number } = {},
   ): Promise<SizeBandSeries> => request(`/api/cvd-by-size${query({ instrument, timeframe, ...window, ...options })}`),
+
+  /**
+   * Prints at or above `threshold`, newest first. `unit` decides what the threshold measures
+   * and is the same measure `sizeBands` bands by, so "5k" means the same thing in both.
+   *
+   * The counts in the answer cover the whole window; `rows` is only the newest `limit` of
+   * them, and `truncated` says so. A window with no stored prints answers with `prints: 0`,
+   * which is not the same as finding nothing big.
+   */
+  clusterSearch: (
+    instrument: string,
+    timeframe: string,
+    window: BarWindow,
+    options: { threshold: number; unit?: string; limit?: number },
+  ): Promise<ClusterSearchSeries> =>
+    request(`/api/cluster-search${query({ instrument, timeframe, ...window, ...options })}`),
 
   workspaces: () => request<{ items: { name: string; data: unknown; updatedAt: number }[] }>('/api/workspaces'),
 

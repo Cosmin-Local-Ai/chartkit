@@ -5,12 +5,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chartkit_core::{
-    new_id, Alert, AlertKind, AssetClass, FootprintSeries, FootprintSeriesBuilder, SizeBand,
-    SizeBandBar, SizeBandCell, SizeBandLevel, SizeBandSeries, SizeUnit, Timeframe, VolumeProfile,
-    VolumeProfileBuilder,
+    new_id, Alert, AlertKind, AssetClass, ClusterBar, ClusterPrint, ClusterSearch, FootprintSeries,
+    FootprintSeriesBuilder, SizeBand, SizeBandBar, SizeBandCell, SizeBandLevel, SizeBandSeries,
+    SizeUnit, Timeframe, Trade, VolumeProfile, VolumeProfileBuilder,
 };
 use chartkit_ingest::credentials::venue_from_slug;
-use chartkit_store::{BarFilter, SizeBandRow, StoreError};
+use chartkit_store::{BarFilter, ClusterBarRow, SizeBandRow, StoreError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -421,15 +421,33 @@ fn bar_span_ms(timeframe: Timeframe) -> Result<i64, ApiError> {
     }
 }
 
+/// What "size" means in a request: the quote a print traded for, or how much of the
+/// instrument it was. Both the band split and the cluster search read it the same way, so a
+/// threshold means the same thing in both places.
+fn size_unit(spec: Option<&str>) -> Result<SizeUnit, ApiError> {
+    match spec.filter(|u| !u.is_empty()) {
+        None | Some("notional") => Ok(SizeUnit::Notional),
+        Some("quantity") => Ok(SizeUnit::Quantity),
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "unknown size unit {other}; try notional or quantity"
+        ))),
+    }
+}
+
+/// The measure a size is expressed in, in the words both endpoints put in their answer.
+fn size_measure(unit: SizeUnit) -> &'static str {
+    match unit {
+        SizeUnit::Notional => "quote notional per print",
+        SizeUnit::Quantity => "quantity per print",
+    }
+}
+
 /// The band edges to aggregate with, and the sentence that says how they were chosen.
 fn size_edges(
     spec: Option<&str>,
     unit: SizeUnit,
 ) -> Result<(Vec<f64>, String), ApiError> {
-    let measure = match unit {
-        SizeUnit::Notional => "quote notional per print",
-        SizeUnit::Quantity => "quantity per print",
-    };
+    let measure = size_measure(unit);
     let (edges, named) = match spec.filter(|s| !s.is_empty()) {
         None => (DEFAULT_SIZE_EDGES.to_vec(), Some("standard".to_string())),
         Some(spec) if spec.contains(',') => {
@@ -581,13 +599,7 @@ pub async fn size_bands(
     let timeframe = query.timeframe.parse::<Timeframe>().map_err(ApiError::BadRequest)?;
     let bar_ms = bar_span_ms(timeframe)?;
     let limit = query.limit.unwrap_or(240).clamp(1, 5_000);
-    let unit = match query.unit.as_deref().filter(|u| !u.is_empty()) {
-        None | Some("notional") => SizeUnit::Notional,
-        Some("quantity") => SizeUnit::Quantity,
-        Some(other) => {
-            return Err(ApiError::BadRequest(format!("unknown size unit {other}; try notional or quantity")))
-        }
-    };
+    let unit = size_unit(query.unit.as_deref())?;
     let view = match query.view.as_deref().filter(|v| !v.is_empty()) {
         None | Some("bars") => SizeBandView::Bars,
         Some("levels") => SizeBandView::Levels,
@@ -728,6 +740,148 @@ fn assemble_size_bands(
     }
 }
 
+// ---------------------------------------------------------------- cluster search
+
+/// Prints a cluster search lists, and the most any caller may ask for. The window's counts
+/// come back whatever the cap, so a capped list still says how large the answer was.
+const CLUSTER_ROWS: i64 = 400;
+const CLUSTER_ROWS_MAX: i64 = 2_000;
+
+#[derive(Deserialize)]
+pub struct ClusterQuery {
+    pub instrument: String,
+    /// Bars the per-bar cluster counts are grouped by, the same interval the chart uses.
+    #[serde(default = "default_timeframe")]
+    pub timeframe: String,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    /// Smallest size a print may have and still be listed, measured in `unit`.
+    pub threshold: f64,
+    /// `notional` (default) or `quantity` — the same measure `/api/cvd-by-size` bands by.
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// Rows to return, newest first. The counts cover the window whatever this is.
+    pub limit: Option<i64>,
+}
+
+/// Prints at or above one size, listed newest first, with the counts of the window they were
+/// searched in. Both the list and the counts are decided in SQL over the same seek
+/// `/api/cvd-by-size` aggregates on, so the prints themselves never travel out of the store
+/// and a wide window costs a scan rather than a copy of itself.
+///
+/// The threshold is inclusive, which is how the top size band of a ladder ending at the same
+/// number already counts: a print exactly on an edge belongs to the band above it. Asking
+/// `/api/cvd-by-size` for a ladder whose last edge is this threshold answers with the same
+/// prints, bar for bar.
+pub async fn cluster_search(
+    State(state): State<AppState>,
+    Query(query): Query<ClusterQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let timeframe = query.timeframe.parse::<Timeframe>().map_err(ApiError::BadRequest)?;
+    let bar_ms = bar_span_ms(timeframe)?;
+    let unit = size_unit(query.unit.as_deref())?;
+    let limit = query.limit.unwrap_or(CLUSTER_ROWS).clamp(1, CLUSTER_ROWS_MAX);
+    if !query.threshold.is_finite() || query.threshold <= 0.0 {
+        return Err(ApiError::BadRequest(format!(
+            "threshold must be a positive size, got {}",
+            query.threshold
+        )));
+    }
+    let instrument = state
+        .db
+        .instrument(&query.instrument)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::NotFound(format!("no instrument {}", query.instrument)))?;
+    // Same rule as the footprint, the profile and the band split: a window the live stream
+    // never saw is pulled before it is searched, so "nothing here" is an answer about the
+    // venue and not about a hole in the local store.
+    if let (Some(from), Some(to)) = (query.from, query.to) {
+        state.prints.request_covering(&instrument, from, to).await;
+    }
+    let size_rule = format!(
+        "at or above {} {}",
+        fmt_band_number(query.threshold),
+        size_measure(unit)
+    );
+
+    let state = state.clone();
+    let id = query.instrument.clone();
+    let (from, to, threshold) = (query.from, query.to, query.threshold);
+    let series = tokio::task::spawn_blocking(move || -> Result<ClusterSearch, StoreError> {
+        let listed = state.db.cluster_prints(&id, from, to, threshold, unit, limit)?;
+        let counted = state.db.cluster_bars(&id, from, to, threshold, unit, bar_ms)?;
+        Ok(assemble_clusters(
+            id, timeframe, from, to, unit, size_rule, threshold, limit, listed, counted,
+        ))
+    })
+    .await
+    .map_err(|e| ApiError::Task(e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(serde_json::to_value(series)?))
+}
+
+/// Turns the listed prints and the per-bar counts into the answer.
+///
+/// The counts are the whole window's, the rows are the newest `limit` of them, and
+/// `truncated` says when those two are not the same set. A window that holds no prints at all
+/// answers with `prints: 0`, which a client must not render as "searched, nothing big".
+fn assemble_clusters(
+    instrument: String,
+    timeframe: Timeframe,
+    from: Option<i64>,
+    to: Option<i64>,
+    unit: SizeUnit,
+    size_rule: String,
+    threshold: f64,
+    limit: i64,
+    listed: Vec<Trade>,
+    counted: Vec<ClusterBarRow>,
+) -> ClusterSearch {
+    let mut bars: Vec<ClusterBar> = Vec::new();
+    let mut answer = ClusterSearch {
+        instrument,
+        timeframe,
+        from,
+        to,
+        size_unit: unit,
+        size_rule,
+        threshold,
+        prints: 0,
+        clusters: 0,
+        returned: listed.len() as u64,
+        limit,
+        truncated: false,
+        cluster_qty: 0.0,
+        cluster_notional: 0.0,
+        buy_n: 0,
+        sell_n: 0,
+        rows: listed.iter().map(ClusterPrint::of).collect(),
+        bars: Vec::new(),
+    };
+    for row in &counted {
+        let hits = row.hits.max(0) as u64;
+        answer.prints += row.prints.max(0) as u64;
+        answer.clusters += hits;
+        answer.cluster_qty += row.hit_qty;
+        answer.cluster_notional += row.hit_notional;
+        answer.buy_n += row.hit_buy_n.max(0) as u64;
+        answer.sell_n += row.hit_sell_n.max(0) as u64;
+        // A bar with no cluster print has nothing to mark, so it does not travel.
+        if hits > 0 {
+            bars.push(ClusterBar {
+                start: row.group,
+                prints: hits,
+                buy_n: row.hit_buy_n.max(0) as u64,
+                sell_n: row.hit_sell_n.max(0) as u64,
+                qty: row.hit_qty,
+                notional: row.hit_notional,
+            });
+        }
+    }
+    answer.truncated = answer.clusters > answer.returned;
+    answer.bars = bars;
+    answer
+}
 
 
 /// A rule as a client sends it. The server owns the id, the timestamps and the crossing
@@ -890,6 +1044,7 @@ pub async fn delete_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chartkit_core::Side;
 
     #[test]
     fn a_draft_builds_a_rule_the_evaluator_can_judge() {
@@ -1128,5 +1283,87 @@ mod tests {
         let folded = fold_size_bands(&stray, 4);
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].1[0].buy_qty, 2.0, "the band that exists still gets its volume");
+    }
+
+    /// One bar of cluster counts: what it holds, and the part that cleared the threshold.
+    fn counted(group: i64, prints: i64, hits: i64, qty: f64, notional: f64, buy_n: i64, sell_n: i64) -> ClusterBarRow {
+        ClusterBarRow { group, prints, hits, hit_qty: qty, hit_notional: notional, hit_buy_n: buy_n, hit_sell_n: sell_n }
+    }
+
+    fn print(ts: i64, seq: u64, price: f64, qty: f64, buy: bool) -> Trade {
+        Trade { ts, seq, price, qty, aggressor: if buy { Side::Buy } else { Side::Sell } }
+    }
+
+    fn search(limit: i64, listed: Vec<Trade>, bars: Vec<ClusterBarRow>) -> ClusterSearch {
+        assemble_clusters(
+            "BINANCE:BTCUSDT".into(),
+            Timeframe::Minute(1),
+            Some(0),
+            Some(180_000),
+            SizeUnit::Notional,
+            "at or above 5k quote notional per print".into(),
+            5_000.0,
+            limit,
+            listed,
+            bars,
+        )
+    }
+
+    #[test]
+    fn the_counts_answer_for_the_window_and_the_rows_only_for_the_newest() {
+        // Two bars: 4 prints of which 3 clear the threshold, and a list the cap cut to 2.
+        let bars = vec![
+            counted(0, 2, 2, 12.0, 12_000.0, 2, 0),
+            counted(60_000, 2, 1, 5.5, 5_500.0, 0, 1),
+        ];
+        let listed = vec![print(60_000, 9, 1_000.0, 5.5, false), print(1_000, 3, 1_000.0, 8.0, true)];
+        let answer = search(2, listed.clone(), bars);
+
+        assert_eq!((answer.prints, answer.clusters), (4, 3), "the counts stopped at the rows the cap kept");
+        assert_eq!((answer.returned, answer.truncated), (2, true), "a capped list has to say it is capped");
+        assert_eq!((answer.cluster_qty, answer.cluster_notional), (17.5, 17_500.0));
+        assert_eq!((answer.buy_n, answer.sell_n), (2, 1));
+        let want: Vec<ClusterPrint> = listed.iter().map(ClusterPrint::of).collect();
+        assert_eq!(answer.rows, want, "the rows travel newest first, as the store sent them");
+        assert_eq!(
+            answer.rows[0],
+            ClusterPrint { ts: 60_000, seq: 9, price: 1_000.0, qty: 5.5, notional: 5_500.0, aggressor: Side::Sell },
+            "the notional on the row is the one the server filtered on"
+        );
+
+        // Only bars that hold a cluster are worth marking, oldest first.
+        assert_eq!(answer.bars.iter().map(|bar| bar.start).collect::<Vec<_>>(), vec![0, 60_000]);
+        assert_eq!((answer.bars[0].prints, answer.bars[0].buy_n), (2, 2));
+
+        // Nothing cut: the list is the whole answer, so the cap goes unmentioned.
+        let whole = search(10, listed, vec![counted(0, 1, 1, 8.0, 8_000.0, 1, 0), counted(60_000, 3, 1, 5.5, 5_500.0, 0, 1)]);
+        assert_eq!((whole.clusters, whole.returned, whole.truncated), (2, 2, false));
+    }
+
+    #[test]
+    fn a_window_with_no_prints_is_not_answered_like_a_window_with_no_big_ones() {
+        // The window holds prints, none of them big enough: an honest empty list.
+        let quiet = search(400, Vec::new(), vec![counted(0, 900, 0, 0.0, 0.0, 0, 0), counted(60_000, 60, 0, 0.0, 0.0, 0, 0)]);
+        assert_eq!((quiet.prints, quiet.clusters, quiet.returned, quiet.truncated), (960, 0, 0, false));
+        assert!(quiet.bars.is_empty(), "a bar with no cluster print has nothing to mark");
+
+        // The window holds no prints at all: the search never looked at anything.
+        let empty = search(400, Vec::new(), Vec::new());
+        assert_eq!((empty.prints, empty.clusters), (0, 0), "no prints is a different answer from no big prints");
+        assert!(empty.bars.is_empty());
+    }
+
+    #[test]
+    fn the_size_rule_names_the_measure_the_threshold_was_filtered_in() {
+        // The same wording the band split uses, so a trader cannot be shown two different
+        // meanings of "5k" in the same product.
+        for unit in [SizeUnit::Notional, SizeUnit::Quantity] {
+            let rule = format!("at or above {} {}", fmt_band_number(5_000.0), size_measure(unit));
+            assert!(rule.contains(size_measure(unit)), "{rule}");
+            assert_eq!(size_unit(Some(match unit { SizeUnit::Notional => "notional", SizeUnit::Quantity => "quantity" })).unwrap(), unit);
+        }
+        assert_eq!(size_unit(None).unwrap(), SizeUnit::Notional, "notional is the default in both endpoints");
+        assert!(size_unit(Some("lots")).is_err());
+        assert!(size_unit(Some("")).is_ok(), "an empty parameter is the same as none");
     }
 }

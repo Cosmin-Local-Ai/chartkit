@@ -341,6 +341,83 @@ pub struct SizeBandSeries {
     pub delta: f64,
 }
 
+/// One print at or above the cluster threshold. The notional travels with the row so the
+/// screen shows the number the server filtered on rather than one the client rebuilt.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterPrint {
+    pub ts: i64,
+    /// Venue sequence, the other half of the print's primary key, so a listed row can be
+    /// found again in the store.
+    pub seq: u64,
+    pub price: f64,
+    pub qty: f64,
+    pub notional: f64,
+    pub aggressor: Side,
+}
+
+impl ClusterPrint {
+    pub fn of(trade: &Trade) -> Self {
+        Self {
+            ts: trade.ts,
+            seq: trade.seq,
+            price: trade.price,
+            qty: trade.qty,
+            notional: trade.price * trade.qty,
+            aggressor: trade.aggressor,
+        }
+    }
+}
+
+/// How many of one bar's prints cleared the threshold, and what they were worth. `notional`
+/// over `qty` is the volume-weighted price of exactly those prints, which is where the
+/// bar's cluster sits on the chart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterBar {
+    pub start: i64,
+    pub prints: u64,
+    pub buy_n: u64,
+    pub sell_n: u64,
+    pub qty: f64,
+    pub notional: f64,
+}
+
+/// Prints at or above one size, newest first, with the counts of the window they were
+/// searched in. The counts are the whole window's; `rows` is the newest `limit` of them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterSearch {
+    pub instrument: String,
+    pub timeframe: Timeframe,
+    /// Requested window, echoed back so a client can tell what the rows actually cover.
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    /// The measure `threshold` is expressed in, the same one the size-band split bands by.
+    pub size_unit: SizeUnit,
+    /// The threshold and its measure, in words the client prints verbatim.
+    pub size_rule: String,
+    pub threshold: f64,
+    /// Every print the window holds, big or small. Zero means the window holds no prints at
+    /// all, which is a different answer from "nothing in it was big enough".
+    pub prints: u64,
+    /// Prints that cleared the threshold.
+    pub clusters: u64,
+    /// Rows actually sent, and the cap the server applied.
+    pub returned: u64,
+    pub limit: i64,
+    /// True when the cap cut the list short: `clusters` still says how many there were.
+    pub truncated: bool,
+    pub cluster_qty: f64,
+    pub cluster_notional: f64,
+    pub buy_n: u64,
+    pub sell_n: u64,
+    pub rows: Vec<ClusterPrint>,
+    /// Bars holding at least one cluster print, oldest first. A bar with none is left out,
+    /// since the chart only needs the places to mark.
+    pub bars: Vec<ClusterBar>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileBucket {
