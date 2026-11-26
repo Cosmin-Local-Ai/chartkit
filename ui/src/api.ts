@@ -6,6 +6,7 @@ import type {
   FootprintSeries,
   Instrument,
   InstrumentSummary,
+  SizeBandSeries,
   Trade,
   VolumeProfile,
 } from './types';
@@ -111,6 +112,19 @@ export const api = {
    */
   profile: (instrument: string, window: BarWindow, valueArea: number): Promise<VolumeProfile> =>
     request(`/api/profile${query({ instrument, ...window, valueArea })}`),
+
+  /**
+   * Prints of `window` split by order size. The band edges are the server's: `bands` names
+   * one of its ladders (`standard`, `small`, `block`) or lists edges outright, and the edges
+   * actually used come back in the answer. `view` picks the bars, the price levels, or both,
+   * because each section costs a scan of the window and the other does not.
+   */
+  sizeBands: (
+    instrument: string,
+    timeframe: string,
+    window: BarWindow,
+    options: { view?: 'bars' | 'levels' | 'both'; bands?: string; unit?: string; ticks?: number } = {},
+  ): Promise<SizeBandSeries> => request(`/api/cvd-by-size${query({ instrument, timeframe, ...window, ...options })}`),
 
   workspaces: () => request<{ items: { name: string; data: unknown; updatedAt: number }[] }>('/api/workspaces'),
 

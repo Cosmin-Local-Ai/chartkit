@@ -21,6 +21,8 @@ import {
   type CvdAnchor,
   type PrintFlow,
 } from './flow';
+import type { SizeBandFlow } from '../sizeBands';
+import { bandCumulative, sizeBandNote } from '../sizeBands';
 import type { Values } from './tas';
 import {
   atr,
@@ -125,9 +127,18 @@ export interface IndicatorDefinition {
   group: (typeof INDICATOR_GROUPS)[number];
   /** Needs the per-bar buy/sell the prints give, so the app loads a print window for it. */
   needsPrints?: boolean;
+  /**
+   * Needs the server's size-band split, so the app loads a `/api/cvd-by-size` window for
+   * it. The bands are the server's decision and arrive with the answer.
+   */
+  needsSizeBands?: boolean;
   params: ParamDescriptor[];
   pane?: PaneStyle;
-  compute(bars: readonly Bar[], params: ParamValues, flow: PrintFlow | null): IndicatorResult;
+  /**
+   * `flow` is the per-bar buy/sell of the prints, `bands` the same window split by print
+   * size. An indicator reads the one it declares and ignores the rest.
+   */
+  compute(bars: readonly Bar[], params: ParamValues, flow: PrintFlow | null, bands?: SizeBandFlow | null): IndicatorResult;
 }
 
 const SOURCE_OPTIONS: readonly string[] = ['close', 'open', 'high', 'low'];
@@ -234,6 +245,12 @@ function cvdParams(color: readonly string[], slot: string): ParamDescriptor[] {
     { name: 'smooth', label: 'Smooth', kind: 'boolean', default: false },
   ];
 }
+
+/*
+ * The band names the default ladder answers with, used only before a window has arrived:
+ * once the response is in, the lines take the labels the server sent instead.
+ */
+const CVD_BY_SIZE_SLOTS: readonly string[] = ['under 1k', '1k to 10k', '10k to 100k', '100k and up'];
 
 /** Running delta since the anchor, which is what both CVD types plot. */
 function cumulativeResult(bars: readonly Bar[], params: ParamValues, flow: PrintFlow | null, label: string): IndicatorResult {
@@ -920,6 +937,47 @@ export const INDICATORS: readonly IndicatorDefinition[] = [
     params: cvdParams(['#e8b242'], 'Agg CVD'),
     pane: { zeroLine: true, precision: 2 },
     compute: (bars, params, flow) => cumulativeResult(bars, params, flow, 'Agg CVD'),
+  },
+  {
+    // The shipped product carries this as a server-fed type whose payload was never
+    // recovered, so the shape here is this project's own: one cumulative line per size
+    // band, the bands being whatever ladder the server answered with.
+    id: 'CVD_BY_SIZE',
+    label: 'CVD by Size',
+    short: 'CVD Size',
+    placement: 'offchart',
+    group: 'Order flow',
+    needsSizeBands: true,
+    // One colour per band of the default ladder, so a stored instance keeps all four
+    // through the parameter repair every document goes through.
+    params: [
+      { name: 'colors', label: 'Color', kind: 'colors', default: ['#4b9cf5', '#26b98a', '#e8b242', '#c58af9'], slots: CVD_BY_SIZE_SLOTS },
+      { name: 'width', label: 'Width', kind: 'number', default: 2, min: 1, max: 8, step: 1 },
+      { name: 'cvd_anchor', label: 'CVD anchor', kind: 'select', default: 'UTC day', options: CVD_ANCHORS },
+      { name: 'smooth', label: 'Smooth', kind: 'boolean', default: false },
+    ],
+    pane: { zeroLine: true, precision: 2 },
+    compute: (bars, params, _flow, bandsInput) => {
+      const bands = bandsInput ?? null;
+      const anchor = string(params, 'cvd_anchor', 'UTC day') as CvdAnchor;
+      // The line labels are the server's band names, so another ladder relabels the lines
+      // instead of leaving the chart describing bands the response never used.
+      const slots = bands && bands.bands.length > 0 ? bands.bands.map((band) => band.label) : CVD_BY_SIZE_SLOTS;
+      const colors = colorList(params, slots);
+      const width = number(params, 'width', 2);
+      return {
+        caption: `(${anchor}, ${slots.length} bands)`,
+        plots: slots.map((label, band) => ({
+          label,
+          color: colors[band] ?? '#4b9cf5',
+          width,
+          kind: 'line' as const,
+          values: bandCumulative(bars, bands, band, anchor),
+        })),
+        note: sizeBandNote(bands),
+        smooth: boolean(params, 'smooth', false),
+      };
+    },
   },
   {
     id: 'CVD_FLOW_DOMINANCE',

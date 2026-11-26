@@ -65,8 +65,10 @@ export const DEFAULT_STATE: WorkspaceState = {
   timeframe: '1m',
   seriesStyle: 'candles',
   watchlist: [],
-  panes: { volume: true, footprint: true, profile: true, ladder: true, sidebar: true },
-  weights: { price: 3.2, volume: 1, footprint: 1.6, profile: 1.2 },
+  // The size-band grid starts switched off: it is an extra way to read the same prints, and
+  // a workspace that has never asked for it should not pay a window scan for it.
+  panes: { volume: true, footprint: true, profile: true, sizeBands: false, ladder: true, sidebar: true },
+  weights: { price: 3.2, volume: 1, footprint: 1.6, profile: 1.2, sizeBands: 1.1 },
   weightsCustomized: false,
   // No barStep: a workspace that has never saved a zoom gets one from the view's density
   // target, which needs the plot width and so can only be worked out on the first frame.

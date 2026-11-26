@@ -9,6 +9,7 @@
  */
 
 import type { Bar } from '../types';
+import type { SizeBandFlow } from '../sizeBands';
 import type { PrintFlow } from './flow';
 import type { ParamValues } from './registry';
 
@@ -27,6 +28,17 @@ export function barsSignature(bars: readonly Bar[]): string {
 export function flowSignature(flow: PrintFlow | null): string {
   if (!flow) return 'none';
   return `${flow.instrument}:${flow.timeframe}:${flow.coveredFrom}:${flow.coveredTo}:${flow.prints}:${flow.loading ? 1 : 0}`;
+}
+
+/**
+ * Size-band window signature: the covered range, the print count behind it and the bands
+ * the answer named. A different ladder is a different series even over the same prints, so
+ * the band names belong in the key.
+ */
+export function bandSignature(bands: SizeBandFlow | null): string {
+  if (!bands) return 'none';
+  const labels = bands.bands.map((band) => band.label).join('|');
+  return `${bands.instrument}:${bands.timeframe}:${labels}:${bands.coveredFrom}:${bands.coveredTo}:${bands.prints}:${bands.loading ? 1 : 0}`;
 }
 
 export function paramsSignature(params: ParamValues): string {

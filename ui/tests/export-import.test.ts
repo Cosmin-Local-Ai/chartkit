@@ -378,8 +378,10 @@ function sampleDocument(): WorkspaceState {
     timeframe: '5m',
     seriesStyle: 'candles',
     watchlist: ['BINANCE:BTCUSDT', 'BINANCE:ETHUSDT'],
-    panes: { volume: true, footprint: false, profile: true, ladder: false, sidebar: true },
-    weights: { price: 4.25, volume: 1.5, footprint: 2.75, profile: 1.25 },
+    // The size-band grid is part of the document like any other pane: switched on here so a
+    // file that turns it off cannot quietly restore it on.
+    panes: { volume: true, footprint: false, profile: true, sizeBands: true, ladder: false, sidebar: true },
+    weights: { price: 4.25, volume: 1.5, footprint: 2.75, profile: 1.25, sizeBands: 0.9 },
     weightsCustomized: true,
     view,
     indicators: [

@@ -2,7 +2,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chartkit_core::{
-    Alert, AlertFire, AlertKind, AssetClass, Bar, Instrument, Session, Side, Timeframe, Trade, Venue,
+    Alert, AlertFire, AlertKind, AssetClass, Bar, Instrument, Session, Side, SizeUnit, Timeframe,
+    Trade, Venue,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,20 @@ pub struct BarFilter {
     /// Exclusive upper bound, or None for the newest stored bar.
     pub to: Option<i64>,
     pub limit: i64,
+}
+
+/// One group of a size-band aggregation: a band index inside a group key, split by
+/// aggressor. `group` is a bar start in milliseconds for the bar grouping, or a tick
+/// index for the price grouping. The aggregation happens in SQL, so this is the whole
+/// answer: prints never travel out of the store.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SizeBandRow {
+    pub group: i64,
+    pub band: i64,
+    pub buy_qty: f64,
+    pub sell_qty: f64,
+    pub buy_n: i64,
+    pub sell_n: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -604,6 +619,116 @@ impl Db {
         Ok(seen)
     }
 
+    /// Prints of one window split into size bands and grouped by bar, aggregated entirely
+    /// in SQL. The answer is one row per (bar, band), so a wide window costs a scan of the
+    /// window rather than a copy of it in memory.
+    ///
+    /// `edges` are the band upper bounds in ascending order, measured in `unit`: a print
+    /// smaller than the first edge is band 0, one at or above the last edge is band
+    /// `edges.len()`. `bar_ms` is one bar of the interval in milliseconds, and the window
+    /// is half-open like every other print read.
+    pub fn size_band_bars(
+        &self,
+        instrument: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        edges: &[f64],
+        unit: SizeUnit,
+        bar_ms: i64,
+    ) -> Result<Vec<SizeBandRow>, StoreError> {
+        let band = band_case_expr(edges, size_expr(unit));
+        let sql = format!(
+            "SELECT (ts / ?{bar_ms}) * ?{bar_ms} AS bar,
+                    {band} AS band,
+                    SUM(CASE WHEN aggressor = 'buy' THEN qty ELSE 0.0 END),
+                    SUM(CASE WHEN aggressor = 'sell' THEN qty ELSE 0.0 END),
+                    SUM(CASE WHEN aggressor = 'buy' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN aggressor = 'sell' THEN 1 ELSE 0 END)
+               FROM trades
+              WHERE instrument_id = ?{i}
+                AND ts >= ?{from} AND ts < ?{to}
+              GROUP BY bar, band
+              ORDER BY bar, band",
+            bar_ms = edges.len() + 1,
+            i = edges.len() + 2,
+            from = edges.len() + 3,
+            to = edges.len() + 4,
+        );
+        let span = [&bar_ms as &dyn rusqlite::ToSql];
+        self.size_band_rows(&sql, instrument, from, to, edges, &span)
+    }
+
+    /// The same prints and the same bands, grouped by price level instead of by time.
+    /// `price_tick` is the venue's tick and `step_ticks` ticks fold into one row, so
+    /// `group` comes back as a tick index. The rounding matches `tick_index`, which keeps
+    /// a level row the same price the footprint and the profile put on that grid.
+    pub fn size_band_levels(
+        &self,
+        instrument: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        edges: &[f64],
+        unit: SizeUnit,
+        price_tick: f64,
+        step_ticks: i64,
+    ) -> Result<Vec<SizeBandRow>, StoreError> {
+        let band = band_case_expr(edges, size_expr(unit));
+        let sql = format!(
+            "SELECT (CAST(ROUND(price / ?{tick}) AS INTEGER) / ?{step}) * ?{step} AS level,
+                    {band} AS band,
+                    SUM(CASE WHEN aggressor = 'buy' THEN qty ELSE 0.0 END),
+                    SUM(CASE WHEN aggressor = 'sell' THEN qty ELSE 0.0 END),
+                    SUM(CASE WHEN aggressor = 'buy' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN aggressor = 'sell' THEN 1 ELSE 0 END)
+               FROM trades
+              WHERE instrument_id = ?{i}
+                AND ts >= ?{from} AND ts < ?{to}
+              GROUP BY level, band
+              ORDER BY level, band",
+            tick = edges.len() + 1,
+            step = edges.len() + 2,
+            i = edges.len() + 3,
+            from = edges.len() + 4,
+            to = edges.len() + 5,
+        );
+        let grid = [
+            &price_tick as &dyn rusqlite::ToSql,
+            &step_ticks as &dyn rusqlite::ToSql,
+        ];
+        self.size_band_rows(&sql, instrument, from, to, edges, &grid)
+    }
+
+    /// Runs one size-band aggregation. The band edges are compared in the `CASE` in the
+    /// order they arrive, so they bind as the first parameters of the statement and every
+    /// other argument follows them.
+    ///
+    /// The window is written as a plain `ts >= ? AND ts < ?` rather than the
+    /// `(? IS NULL OR ts >= ?)` the streamed print reads use: SQLite will not fold a guard
+    /// like that into an index seek, and the aggregation would then walk every print the
+    /// instrument holds instead of only the window. An absent bound becomes the end of the
+    /// time range, which the same seek covers.
+    fn size_band_rows(
+        &self,
+        sql: &str,
+        instrument: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        edges: &[f64],
+        extra: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<SizeBandRow>, StoreError> {
+        let guard = self.lock()?;
+        let mut stmt = guard.prepare_cached(sql)?;
+        let (oldest, newest) = (from.unwrap_or(i64::MIN), to.unwrap_or(i64::MAX));
+        let mut args: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(edges.len() + extra.len() + 3);
+        args.extend(edges.iter().map(|edge| edge as &dyn rusqlite::ToSql));
+        args.extend(extra.iter().copied());
+        args.push(&instrument);
+        args.push(&oldest);
+        args.push(&newest);
+        let rows = stmt.query_map(args.as_slice(), read_size_band_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// The plans of both print window reads, joined. A test hook: a plan that says SCAN
     /// is a request that starts walking every print an instrument holds.
     #[cfg(test)]
@@ -624,6 +749,37 @@ impl Db {
              ORDER BY ts, seq",
         )?;
         plans.push(read_plan(&mut stmt, rusqlite::params!["BINANCE:BTCUSDT", 0i64, 1i64, 0i64, 0i64])?);
+        Ok(plans.join(" || "))
+    }
+
+    /// The plans of both size-band aggregations, joined. A test hook, for the same reason:
+    /// an aggregation that walks every print an instrument holds instead of the window is
+    /// a request that gets slower as history grows.
+    #[cfg(test)]
+    fn size_band_plans(&self) -> Result<String, StoreError> {
+        let edges = [1_000.0f64, 10_000.0, 100_000.0];
+        let guard = self.lock()?;
+        let mut plans: Vec<String> = Vec::new();
+        for sql in [
+            band_case_expr(&edges, size_expr(SizeUnit::Notional)),
+            band_case_expr(&edges, size_expr(SizeUnit::Quantity)),
+        ]
+        .into_iter()
+        .map(|band| {
+            format!(
+                "EXPLAIN QUERY PLAN SELECT (ts / ?4) * ?4 AS bar, {band} AS band,
+                        SUM(CASE WHEN aggressor = 'buy' THEN qty ELSE 0.0 END)
+                   FROM trades
+                  WHERE instrument_id = ?5 AND ts >= ?6 AND ts < ?7
+                  GROUP BY bar, band"
+            )
+        }) {
+            let mut stmt = guard.prepare_cached(&sql)?;
+            plans.push(read_plan(
+                &mut stmt,
+                rusqlite::params![1_000.0, 10_000.0, 100_000.0, 60_000i64, "BINANCE:BTCUSDT", 0i64, 1i64],
+            )?);
+        }
         Ok(plans.join(" || "))
     }
 
@@ -1257,6 +1413,39 @@ fn read_plan(stmt: &mut rusqlite::Statement<'_>, params: &[&dyn rusqlite::ToSql]
     Ok(rows.collect::<Result<Vec<_>, _>>()?.join(", "))
 }
 
+/// Volume split by print size, measured in the unit the bands were asked for.
+fn size_expr(unit: SizeUnit) -> &'static str {
+    match unit {
+        SizeUnit::Notional => "qty * price",
+        SizeUnit::Quantity => "qty",
+    }
+}
+
+/// `CASE` that puts a print in band 0..=edges.len(). The edges are tested in order and
+/// each test is strict, so a print exactly on an edge lands in the band above it and in
+/// no other band: the bands are half-open intervals that tile the line with no overlap.
+fn band_case_expr(edges: &[f64], size: &str) -> String {
+    let mut sql = String::from("CASE");
+    for (index, _) in edges.iter().enumerate() {
+        sql.push_str(&format!(" WHEN {size} < ?{} THEN {index}", index + 1));
+    }
+    sql.push_str(&format!(" ELSE {} END", edges.len()));
+    sql
+}
+
+/// Reads one aggregated size-band row. The grouping column is a bar start or a tick
+/// index; the caller knows which because it asked for one or the other.
+fn read_size_band_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SizeBandRow> {
+    Ok(SizeBandRow {
+        group: row.get(0)?,
+        band: row.get(1)?,
+        buy_qty: row.get(2)?,
+        sell_qty: row.get(3)?,
+        buy_n: row.get(4)?,
+        sell_n: row.get(5)?,
+    })
+}
+
 /// Reads one print row. Shared by the collected and the streamed window reads, so the
 /// two cannot drift apart.
 fn read_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
@@ -1869,5 +2058,254 @@ mod tests {
         assert!(db.alert("nope").expect("missing rule").is_none());
         assert_eq!(db.newest_print(ID).expect("no prints"), None);
         assert!(db.newest_closed_bar(ID, "5m").expect("no bars").is_none());
+    }
+
+    /// The band a size belongs to, decided in plain Rust: the first edge it falls under,
+    /// or the top band when it falls under none. Edges are upper bounds, exclusive.
+    fn band_of(size: f64, edges: &[f64]) -> i64 {
+        edges.iter().position(|edge| size < *edge).map_or(edges.len() as i64, |i| i as i64)
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    struct Sided {
+        buy: f64,
+        sell: f64,
+        buy_n: i64,
+        sell_n: i64,
+    }
+
+    impl Sided {
+        fn add(&mut self, print: &Trade) {
+            match print.aggressor {
+                Side::Buy => {
+                    self.buy += print.qty;
+                    self.buy_n += 1;
+                }
+                Side::Sell => {
+                    self.sell += print.qty;
+                    self.sell_n += 1;
+                }
+            }
+        }
+    }
+
+    /// Prints whose notionals straddle both edges, including one exactly on each, spread
+    /// over three minutes and five price levels. Every quantity and price is a dyadic
+    /// rational, so the sums below are exact however they are grouped.
+    fn banded_prints() -> Vec<Trade> {
+        let prices = [100.0, 100.5, 101.0, 104.5, 110.0];
+        let qtys = [0.25, 1.0, 4.0, 5.0, 16.0, 50.0];
+        let mut prints = Vec::new();
+        let mut seq = 1u64;
+        for minute in 0..3i64 {
+            for (level, price) in prices.iter().enumerate() {
+                for (slot, qty) in qtys.iter().enumerate() {
+                    prints.push(Trade {
+                        ts: minute * 60_000 + (level * 7 + slot * 3) as i64,
+                        seq,
+                        price: *price,
+                        qty: *qty,
+                        aggressor: if (level + slot) % 2 == 0 { Side::Buy } else { Side::Sell },
+                    });
+                    seq += 1;
+                }
+            }
+        }
+        prints
+    }
+
+    #[test]
+    fn sql_size_bands_answer_exactly_as_the_same_prints_counted_in_rust() {
+        let db = Db::in_memory().expect("in-memory store");
+        let prints = banded_prints();
+        db.record_trades(ID, &prints).expect("prints");
+
+        let edges = [500.0, 5_000.0];
+        let rows = db
+            .size_band_bars(ID, None, None, &edges, SizeUnit::Notional, 60_000)
+            .expect("band aggregation by bar");
+
+        let mut want: std::collections::BTreeMap<(i64, i64), Sided> = std::collections::BTreeMap::new();
+        for print in &prints {
+            let band = band_of(print.qty * print.price, &edges);
+            want.entry((print.ts.div_euclid(60_000) * 60_000, band)).or_default().add(print);
+        }
+        let got: std::collections::BTreeMap<(i64, i64), Sided> = rows
+            .iter()
+            .map(|row| {
+                (
+                    (row.group, row.band),
+                    Sided { buy: row.buy_qty, sell: row.sell_qty, buy_n: row.buy_n, sell_n: row.sell_n },
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "one (bar, band) cell disagrees with the Rust count");
+        assert_eq!(rows.len(), want.len(), "the aggregation returned a group the prints are not in");
+        assert_eq!(rows.iter().map(|r| r.band).min(), Some(0), "the bottom band is used");
+        assert_eq!(rows.iter().map(|r| r.band).max(), Some(2), "the top band is used");
+    }
+
+    #[test]
+    fn a_print_on_a_band_edge_is_counted_once_and_in_one_band() {
+        let db = Db::in_memory().expect("in-memory store");
+        // 100.0 x 5.0 sits exactly on the lower edge, 100.0 x 50.0 exactly on the upper one.
+        let prints = [
+            Trade { ts: 1_000, seq: 1, price: 100.0, qty: 5.0, aggressor: Side::Buy },
+            Trade { ts: 1_001, seq: 2, price: 100.0, qty: 50.0, aggressor: Side::Sell },
+            Trade { ts: 1_002, seq: 3, price: 100.0, qty: 4.99, aggressor: Side::Buy },
+            Trade { ts: 1_003, seq: 4, price: 100.0, qty: 49.99, aggressor: Side::Buy },
+        ];
+        db.record_trades(ID, &prints).expect("prints");
+        let edges = [500.0, 5_000.0];
+        let rows = db
+            .size_band_bars(ID, None, None, &edges, SizeUnit::Notional, 60_000)
+            .expect("band aggregation");
+
+        let bands: std::collections::BTreeMap<i64, Sided> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.band,
+                    Sided { buy: row.buy_qty, sell: row.sell_qty, buy_n: row.buy_n, sell_n: row.sell_n },
+                )
+            })
+            .collect();
+        assert_eq!(bands.len(), 3, "three bands, all of them reached");
+        // 499.0 and 4999.0 fall under the first and second edge; 500.0 falls under the
+        // second only; 5000.0 falls under neither.
+        assert_eq!(
+            bands[&0],
+            Sided { buy: 4.99, sell: 0.0, buy_n: 1, sell_n: 0 },
+            "the print just under the edge is the bottom band"
+        );
+        assert_eq!(
+            bands[&1],
+            Sided { buy: 5.0 + 49.99, sell: 0.0, buy_n: 2, sell_n: 0 },
+            "a print exactly on the edge joins the band above it, and the one just under it stays below"
+        );
+        assert_eq!(
+            bands[&2],
+            Sided { buy: 0.0, sell: 50.0, buy_n: 0, sell_n: 1 },
+            "a print exactly on the top edge leaves the middle band"
+        );
+        let prints_counted: i64 = rows.iter().map(|r| r.buy_n + r.sell_n).sum();
+        assert_eq!(prints_counted, prints.len() as i64, "no print is counted twice or dropped");
+    }
+
+    #[test]
+    fn size_bands_by_price_split_every_level_without_losing_volume() {
+        let db = Db::in_memory().expect("in-memory store");
+        let prints = banded_prints();
+        db.record_trades(ID, &prints).expect("prints");
+
+        let edges = [500.0, 5_000.0];
+        let tick = 0.5;
+        for step in [1i64, 3] {
+            let rows = db
+                .size_band_levels(ID, None, None, &edges, SizeUnit::Notional, tick, step)
+                .expect("band aggregation by level");
+
+            let mut want: std::collections::BTreeMap<(i64, i64), Sided> = std::collections::BTreeMap::new();
+            for print in &prints {
+                let band = band_of(print.qty * print.price, &edges);
+                let level = chartkit_core::tick_index(print.price, tick).div_euclid(step) * step;
+                want.entry((level, band)).or_default().add(print);
+            }
+            let got: std::collections::BTreeMap<(i64, i64), Sided> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        (row.group, row.band),
+                        Sided { buy: row.buy_qty, sell: row.sell_qty, buy_n: row.buy_n, sell_n: row.sell_n },
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "one (level, band) cell disagrees at step {step}");
+
+            // The bands of a level have to add back up to that level on its own, which is
+            // the property the footprint grid reads: no volume in two bands, none missing.
+            let mut by_level: std::collections::BTreeMap<i64, Sided> = std::collections::BTreeMap::new();
+            for print in &prints {
+                let level = chartkit_core::tick_index(print.price, tick).div_euclid(step) * step;
+                by_level.entry(level).or_default().add(print);
+            }
+            for (level, expected) in &by_level {
+                let summed: Sided = rows
+                    .iter()
+                    .filter(|row| row.group == *level)
+                    .fold(Sided::default(), |mut acc, row| {
+                        acc.buy += row.buy_qty;
+                        acc.sell += row.sell_qty;
+                        acc.buy_n += row.buy_n;
+                        acc.sell_n += row.sell_n;
+                        acc
+                    });
+                assert_eq!(&summed, expected, "bands of level {level} do not add up at step {step}");
+            }
+
+            let volume: f64 = rows.iter().map(|r| r.buy_qty + r.sell_qty).sum();
+            let counted: i64 = rows.iter().map(|r| r.buy_n + r.sell_n).sum();
+            let whole: f64 = prints.iter().map(|p| p.qty).sum();
+            assert_eq!(volume, whole, "step {step} lost or invented volume");
+            assert_eq!(counted, prints.len() as i64, "step {step} lost or invented prints");
+        }
+    }
+
+    #[test]
+    fn measuring_size_in_quantity_moves_prints_to_other_bands() {
+        let db = Db::in_memory().expect("in-memory store");
+        let prints = banded_prints();
+        db.record_trades(ID, &prints).expect("prints");
+        let edges = [500.0, 5_000.0];
+        let notional = db
+            .size_band_bars(ID, None, None, &edges, SizeUnit::Notional, 60_000)
+            .expect("notional bands");
+        let quantity = db
+            .size_band_bars(ID, None, None, &edges, SizeUnit::Quantity, 60_000)
+            .expect("quantity bands");
+
+        // Every print here is smaller than 500 of its own quantity, so measuring in
+        // quantity leaves one band and everything in it.
+        assert_eq!(quantity.iter().map(|r| r.band).collect::<std::collections::BTreeSet<_>>(),
+                   std::collections::BTreeSet::from([0]),
+                   "the measure did not change the banding");
+        assert_eq!(
+            quantity.iter().map(|r| r.buy_qty + r.sell_qty).sum::<f64>(),
+            notional.iter().map(|r| r.buy_qty + r.sell_qty).sum::<f64>(),
+            "the same window must weigh the same whatever it is measured in"
+        );
+    }
+
+    #[test]
+    fn a_window_edge_excludes_the_print_standing_on_it() {
+        let db = Db::in_memory().expect("in-memory store");
+        db.record_trades(ID, &banded_prints()).expect("prints");
+        let edges = [500.0, 5_000.0];
+        let all = db.size_band_bars(ID, None, None, &edges, SizeUnit::Notional, 60_000).expect("all");
+        let first = db
+            .size_band_bars(ID, Some(0), Some(60_000), &edges, SizeUnit::Notional, 60_000)
+            .expect("one minute");
+        assert_eq!(
+            first.iter().map(|r| r.group).collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0]),
+            "the window leaked past its exclusive upper bound"
+        );
+        assert!(
+            first.iter().map(|r| r.buy_qty + r.sell_qty).sum::<f64>()
+                < all.iter().map(|r| r.buy_qty + r.sell_qty).sum::<f64>(),
+            "a narrower window answered with the whole range"
+        );
+    }
+
+    #[test]
+    fn size_band_aggregation_walks_the_print_index_and_not_the_table() {
+        let plans = Db::in_memory().expect("in-memory store").size_band_plans().expect("plans");
+        for plan in plans.split(" || ") {
+            assert!(
+                plan.contains("SEARCH trades USING PRIMARY KEY") && plan.contains("ts>") && plan.contains("ts<"),
+                "the aggregation does not seek the (instrument, ts, seq) key by window: {plan}"
+            );
+            assert!(!plan.contains("SCAN trades"), "plan walks every print: {plan}");
+        }
     }
 }

@@ -7,6 +7,8 @@
 
 import type { Bar } from '../types';
 import type { PrintFlow } from './flow';
+import type { SizeBandFlow } from '../sizeBands';
+import { bandSignature } from './signature';
 import {
   cloneValue,
   defaultsFor,
@@ -40,6 +42,7 @@ interface CacheEntry {
   paramsKey: string;
   barsKey: string;
   flowKey: string;
+  bandKey: string;
   result: IndicatorResult;
 }
 
@@ -141,9 +144,10 @@ export class IndicatorEngine {
   /**
    * Computed series for every instance, recomputed only where something changed.
    * `flow` is the per-bar buy/sell the prints give, which the delta family computes
-   * from and every other indicator ignores.
+   * from and every other indicator ignores; `bands` is the same window split by print
+   * size, which only CVD by Size reads.
    */
-  results(bars: readonly Bar[], flow: PrintFlow | null): Map<string, IndicatorResult> {
+  results(bars: readonly Bar[], flow: PrintFlow | null, bands: SizeBandFlow | null): Map<string, IndicatorResult> {
     const out = new Map<string, IndicatorResult>();
     if (bars.length === 0) {
       this.cache.clear();
@@ -151,6 +155,7 @@ export class IndicatorEngine {
     }
     const barsKey = barsSignature(bars);
     const flowKey = flowSignature(flow);
+    const bandKey = bandSignature(bands);
     for (const instance of this.instances) {
       if (instance.indicatorId === SCRIPT_INDICATOR_ID) {
         const series = this.scriptSeries(instance, bars, flow);
@@ -161,12 +166,18 @@ export class IndicatorEngine {
       if (!definition) continue;
       const paramsKey = paramsSignature(instance.params);
       const cached = this.cache.get(instance.id);
-      if (cached && cached.paramsKey === paramsKey && cached.barsKey === barsKey && cached.flowKey === flowKey) {
+      if (
+        cached &&
+        cached.paramsKey === paramsKey &&
+        cached.barsKey === barsKey &&
+        cached.flowKey === flowKey &&
+        cached.bandKey === bandKey
+      ) {
         out.set(instance.id, cached.result);
         continue;
       }
-      const result = definition.compute(bars, instance.params, flow);
-      this.cache.set(instance.id, { paramsKey, barsKey, flowKey, result });
+      const result = definition.compute(bars, instance.params, flow, bands);
+      this.cache.set(instance.id, { paramsKey, barsKey, flowKey, bandKey, result });
       out.set(instance.id, result);
     }
     this.pruneCache();

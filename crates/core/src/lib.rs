@@ -19,7 +19,8 @@ pub use alert::{
 pub use bar::{Bar, BarAggregator};
 pub use flow::{
     DepthDelta, DepthSnapshot, FootprintBar, FootprintSeries, FootprintSeriesBuilder, Level,
-    PriceCell, ProfileBucket, VolumeProfile, VolumeProfileBuilder, Side, Trade,
+    PriceCell, ProfileBucket, SizeBand, SizeBandBar, SizeBandCell, SizeBandLevel, SizeBandSeries,
+    SizeUnit, VolumeProfile, VolumeProfileBuilder, Side, Trade,
 };
 pub use id::new_id;
 pub use instrument::{AssetClass, Instrument, InstrumentId, Session, Venue};

@@ -16,6 +16,7 @@ import { IndicatorPane } from './panes/indicatorPane';
 import { VolumePane } from './panes/volumePane';
 import { FootprintPane } from './panes/footprintPane';
 import { ProfilePane } from './panes/profilePane';
+import { SizeBandsPane } from './panes/sizeBandsPane';
 import { LiveClient } from './live';
 import type { ConnectionPhase } from './live';
 import { DepthLadder } from './depthLadder';
@@ -30,6 +31,7 @@ import { TIMEFRAMES } from './timeframes';
 import { ChartHistory, type HistoryKind } from './history';
 import { IndicatorEngine } from './indicators/engine';
 import { printFlow, type PrintFlow } from './indicators/flow';
+import { sizeBandFlow, type SizeBandFlow } from './sizeBands';
 import { ScriptRuntime } from './indicators/script/runtime';
 import type { IndicatorResult } from './indicators/registry';
 import { IndicatorDialog } from './indicatorDialog';
@@ -65,6 +67,7 @@ import type {
   FootprintSeries,
   Instrument,
   LiveMessage,
+  SizeBandSeries,
 } from './types';
 
 const DEFAULT_INSTRUMENT = 'BINANCE:BTCUSDT';
@@ -91,7 +94,10 @@ const FOOTPRINT_CSV_LIMIT = 5_000;
 const PROFILE_DEBOUNCE_MS = 260;
 const PROFILE_LIVE_REFRESH_MS = 5_000;
 /** Panes that live in the stack and are switched by their own `setVisible`. */
-const STACK_PANES: readonly string[] = ['volume', 'footprint', 'profile'];
+const STACK_PANES: readonly string[] = ['volume', 'footprint', 'profile', 'sizeBands'];
+/** The size-band split follows the visible window on the same debounce as the profile. */
+const SIZE_PANE_DEBOUNCE_MS = 260;
+const SIZE_PANE_LIVE_REFRESH_MS = 5_000;
 const PRICE_GUTTER_HIT = 4;
 /** Height an indicator pane gets until the user drags its splitter. */
 const INDICATOR_PANE_WEIGHT = 1;
@@ -114,6 +120,7 @@ export class ChartApp {
   private readonly volumePane = new VolumePane();
   private readonly footprintPane = new FootprintPane();
   private readonly profilePane = new ProfilePane();
+  private readonly sizeBandsPane = new SizeBandsPane();
   private readonly view = new ChartView();
   private readonly series = new Series();
   private readonly workspace = new WorkspaceStore();
@@ -144,8 +151,20 @@ export class ChartApp {
   private flowTimer: number | null = null;
   private flowFetchedAt = 0;
   private flowBuilt: { series: FootprintSeries | null; loading: boolean; error: string | null; flow: PrintFlow } | null = null;
+  /** Size-band split for the CVD-by-size lines: the visible window, grouped by bar. */
+  private bandSeries: SizeBandSeries | null = null;
+  private bandError: string | null = null;
+  private bandLoading = false;
+  private bandRequested = false;
+  private bandKey = '';
+  private bandGeneration = 0;
+  private bandTimer: number | null = null;
+  private bandFetchedAt = 0;
+  private bandBuilt: { series: SizeBandSeries | null; loading: boolean; error: string | null; flow: SizeBandFlow } | null = null;
   private profileTimer: number | null = null;
   private profileFetchedAt = 0;
+  private sizeBandsTimer: number | null = null;
+  private sizeBandsFetchedAt = 0;
   private lastStatusTick = 0;
   /** Bars pulled on the first load; `?bars=N` lowers it to exercise lazy paging. */
   private readonly initialBarLimit = readInitialBarLimit();
@@ -395,6 +414,7 @@ export class ChartApp {
       { id: 'volume', label: 'Volume' },
       { id: 'footprint', label: 'Footprint' },
       { id: 'profile', label: 'Profile' },
+      { id: 'sizeBands', label: 'Size bands' },
       { id: 'ladder', label: 'Depth' },
       { id: 'sidebar', label: 'Watchlist' },
     ]);
@@ -418,6 +438,7 @@ export class ChartApp {
     this.stack.add({ id: 'volume', weight: this.state.weights.volume ?? 1, minPx: 84, draw: (ctx, frame) => this.volumePane.draw(ctx, frame) });
     this.stack.add({ id: 'footprint', weight: this.state.weights.footprint ?? 1.6, minPx: 140, draw: (ctx, frame) => this.footprintPane.draw(ctx, frame) });
     this.stack.add({ id: 'profile', weight: this.state.weights.profile ?? 1.2, minPx: 120, draw: (ctx, frame) => this.profilePane.draw(ctx, frame) });
+    this.stack.add({ id: 'sizeBands', weight: this.state.weights.sizeBands ?? 1.1, minPx: 120, draw: (ctx, frame) => this.sizeBandsPane.draw(ctx, frame) });
     // Dragging a splitter is an explicit instruction about heights: from then on the user's
     // own weights rule and the price pane no longer reserves its minimum share.
     this.stack.enableSplitters(() => {
@@ -632,6 +653,28 @@ export class ChartApp {
       profileWindow: () => this.profilePane.window,
       profileDebug: () => this.profilePane.debugInfo,
       profileError: () => this.profilePane.error,
+      /** Size-band pane: the window it fetched, the bands it drew and the level under the cursor. */
+      sizeBandsWindow: () => this.sizeBandsPane.window,
+      sizeBandsDebug: () => this.sizeBandsPane.debugInfo,
+      sizeBandsError: () => this.sizeBandsPane.error,
+      /** Size-band window the CVD-by-size lines compute from. */
+      sizeBandFlow: () => {
+        const flow = this.bandInput();
+        return {
+          wanted: this.needsSizeBandFlow(),
+          requested: this.bandRequested,
+          loading: this.bandLoading,
+          key: this.bandKey,
+          error: this.bandError,
+          bands: flow?.bands.map((band) => band.label) ?? [],
+          bandRule: flow?.bandRule ?? null,
+          bars: flow?.byStart.size ?? 0,
+          prints: flow?.prints ?? 0,
+          coveredFrom: flow?.coveredFrom ?? null,
+          coveredTo: flow?.coveredTo ?? null,
+          totals: flow?.totals ?? [],
+        };
+      },
       footprintLast: () => {
         const bars = this.footprintPane.data?.bars;
         const bar = bars?.[bars.length - 1];
@@ -688,6 +731,7 @@ export class ChartApp {
     this.timeframe = this.state.timeframe;
     this.footprintPane.settings = this.state.footprint;
     this.profilePane.settings = this.state.footprint;
+    this.sizeBandsPane.settings = this.state.footprint;
     this.pricePane.style = this.state.seriesStyle;
     // Density and clock before the stored view: the stored zoom is clamped against the
     // stored floor, and it has to be clamped against the one the same document carries.
@@ -748,7 +792,9 @@ export class ChartApp {
     this.ladder.setInstrument(this.instrument);
     this.footprintPane.reset();
     this.profilePane.reset();
+    this.sizeBandsPane.reset();
     this.resetFlow();
+    this.resetBandFlow();
     this.topbar.setInstrument(this.instrument);
     this.state.instrument = this.instrument.id;
     this.view.restore(this.state.view);
@@ -773,7 +819,9 @@ export class ChartApp {
     this.topbar.setTimeframe(key);
     this.footprintPane.reset();
     this.profilePane.reset();
+    this.sizeBandsPane.reset();
     this.resetFlow();
+    this.resetBandFlow();
     if (this.instrument) {
       try {
         await this.series.load(this.instrument.id, key, this.initialBarLimit);
@@ -1140,6 +1188,7 @@ export class ChartApp {
     this.state.footprint = normaliseFootprintSettings(merged);
     this.footprintPane.settings = this.state.footprint;
     this.profilePane.settings = this.state.footprint;
+    this.sizeBandsPane.settings = this.state.footprint;
     this.markDirty();
     this.persist();
   }
@@ -1771,7 +1820,7 @@ export class ChartApp {
     }
 
     this.ensureDecor(bars);
-    this.indicatorResults = this.indicators.results(bars, this.flowInput());
+    this.indicatorResults = this.indicators.results(bars, this.flowInput(), this.bandInput());
     this.overlays = this.indicators.instances.flatMap((instance) => {
       const definition = this.indicators.definitionOf(instance);
       const result = this.indicatorResults.get(instance.id);
@@ -1843,6 +1892,7 @@ export class ChartApp {
       } else if (host.id === 'volume') this.volumePane.draw(host.ctx, frame);
       else if (host.id === 'footprint') this.footprintPane.draw(host.ctx, frame);
       else if (host.id === 'profile') this.profilePane.draw(host.ctx, frame);
+      else if (host.id === 'sizeBands') this.sizeBandsPane.draw(host.ctx, frame);
       // Indicator panes carry their own draw closure, so they need no branch here.
       else if (host.id.startsWith(INDICATOR_PANE_PREFIX)) this.stack.defFor(host.id)?.draw(host.ctx, frame);
     }
@@ -1856,7 +1906,9 @@ export class ChartApp {
     this.loadOlderIfNeeded(x);
     this.scheduleFootprint(x);
     this.scheduleFlow(x);
+    this.scheduleBandFlow(x);
     this.scheduleProfile(x);
+    this.scheduleSizeBands(x);
   }
 
   private ensureDecor(bars: readonly Bar[]): void {
@@ -1983,6 +2035,119 @@ export class ChartApp {
     const flow = printFlow(this.flowSeries, loading, this.flowError);
     this.flowBuilt = { series: this.flowSeries, loading, error: this.flowError, flow };
     return flow;
+  }
+
+  /** Whether any added indicator reads the size-band split. */
+  private needsSizeBandFlow(): boolean {
+    return this.indicators.instances.some((instance) => this.indicators.definitionOf(instance)?.needsSizeBands === true);
+  }
+
+  /**
+   * The visible window split by print size, for the CVD-by-size lines. Same window, same
+   * debounce and the same stop-when-no-needed rule as the print window the delta family
+   * reads; only the grouping differs, since this one is asked for by bar.
+   */
+  private scheduleBandFlow(x: XScale): void {
+    if (!this.needsSizeBandFlow()) {
+      if (this.bandSeries !== null || this.bandRequested) this.resetBandFlow();
+      return;
+    }
+    const instrument = this.instrument;
+    if (!instrument) return;
+    const bars = this.series.bars;
+    const { first, last } = x.visibleRange();
+    const newest = bars[Math.min(bars.length - 1, Math.max(0, last))];
+    const from = bars[Math.max(0, first)]?.start;
+    if (newest === undefined || from === undefined) return;
+    const to = newest.start + this.series.barMs;
+    const limit = Math.max(1, Math.min(FLOW_MAX_BARS, last - first + 1));
+    const key = `${instrument.id}|${this.timeframe}|${from}|${to}|${limit}`;
+    const overdue = !newest.closed && Date.now() - this.bandFetchedAt > FLOW_LIVE_REFRESH_MS;
+    if (!overdue && key === this.bandKey) return;
+    if (this.bandLoading || this.bandTimer !== null) return;
+    this.bandRequested = true;
+    this.bandTimer = window.setTimeout(() => {
+      this.bandTimer = null;
+      this.bandFetchedAt = Date.now();
+      this.bandLoading = true;
+      const generation = ++this.bandGeneration;
+      void api
+        .sizeBands(instrument.id, this.timeframe, { from, to, limit }, { view: 'bars' })
+        .then((series) => {
+          this.bandLoading = false;
+          if (generation !== this.bandGeneration) return;
+          this.bandSeries = series;
+          this.bandError = null;
+          this.bandKey = key;
+          this.markDirty();
+        })
+        .catch((error: unknown) => {
+          this.bandLoading = false;
+          if (generation !== this.bandGeneration) return;
+          this.bandError = errorMessage(error);
+          this.bandKey = key;
+          this.markDirty();
+        });
+    }, FLOW_DEBOUNCE_MS);
+  }
+
+  /**
+   * The size-band window as the per-band series the lines compute from. Rebuilt only when
+   * the response or the pending state changes, since the renderer asks for it every frame.
+   */
+  private bandInput(): SizeBandFlow | null {
+    if (!this.needsSizeBandFlow()) return null;
+    const loading = this.bandLoading || !this.bandRequested;
+    const built = this.bandBuilt;
+    if (built && built.series === this.bandSeries && built.loading === loading && built.error === this.bandError) return built.flow;
+    const flow = sizeBandFlow(this.bandSeries, loading, this.bandError);
+    this.bandBuilt = { series: this.bandSeries, loading, error: this.bandError, flow };
+    return flow;
+  }
+
+  private resetBandFlow(): void {
+    this.bandGeneration += 1;
+    this.bandSeries = null;
+    this.bandError = null;
+    this.bandLoading = false;
+    this.bandRequested = false;
+    this.bandKey = '';
+    this.bandBuilt = null;
+    if (this.bandTimer !== null) {
+      window.clearTimeout(this.bandTimer);
+      this.bandTimer = null;
+    }
+  }
+
+  /**
+   * The size-band grid beside the footprint: the visible window split by print size and
+   * folded into price rows as wide as the pane can draw, which is why the row width travels
+   * with the request. Fetched only while the pane is switched on, since the split costs a
+   * scan of the window it is asked for.
+   */
+  private scheduleSizeBands(x: XScale): void {
+    const instrument = this.instrument;
+    const price = this.framePrice;
+    if (!instrument || !price || !this.stack.isVisible('sizeBands')) return;
+    const bars = this.series.bars;
+    const { first, last } = x.visibleRange();
+    const newest = bars[Math.min(bars.length - 1, Math.max(0, last))];
+    const from = bars[Math.max(0, first)]?.start;
+    if (newest === undefined || from === undefined) return;
+    const to = newest.start + this.series.barMs;
+    const rows = this.sizeBandsPane.rowsAvailable(this.stack.hostFor('sizeBands')?.height ?? 160);
+    const ticks = this.sizeBandsPane.ticksFor(price.min, price.max, instrument.priceTick, rows);
+    if (this.sizeBandsPane.loading) return;
+    const overdue = !newest.closed && Date.now() - this.sizeBandsFetchedAt > SIZE_PANE_LIVE_REFRESH_MS;
+    if (!overdue && !this.sizeBandsPane.needsRefresh(instrument.id, this.timeframe, from, to, ticks)) return;
+    if (this.sizeBandsTimer !== null) return;
+    this.sizeBandsTimer = window.setTimeout(() => {
+      this.sizeBandsTimer = null;
+      this.sizeBandsFetchedAt = Date.now();
+      void this.sizeBandsPane.refresh(instrument.id, this.timeframe, from, to, ticks).then((changed) => {
+        if (changed) this.markDirty();
+      });
+    }, SIZE_PANE_DEBOUNCE_MS);
   }
 
   private resetFlow(): void {

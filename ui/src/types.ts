@@ -96,6 +96,71 @@ export interface VolumeProfile {
   valueArea: number;
 }
 
+/** How a print's size is measured before it is put in a band. */
+export type SizeUnit = 'notional' | 'quantity';
+
+/**
+ * One size band: prints whose size sits in `[min, max)`. The edges are the server's and so
+ * is the label, which is why the chart prints them instead of building its own.
+ */
+export interface SizeBand {
+  min: number | null;
+  max: number | null;
+  label: string;
+}
+
+export interface SizeBandCell {
+  buyQty: number;
+  sellQty: number;
+  buyN: number;
+  sellN: number;
+}
+
+/** One bar of volume split by size band, plus the running delta per band. */
+export interface SizeBandBar {
+  start: number;
+  /** One entry per band, in `bands` order, with a zero where a band saw nothing. */
+  bands: SizeBandCell[];
+  cumulative: number[];
+  totalQty: number;
+  delta: number;
+  trades: number;
+}
+
+/** One price level of volume split by size band. */
+export interface SizeBandLevel {
+  price: number;
+  bands: SizeBandCell[];
+  totalQty: number;
+  delta: number;
+  trades: number;
+}
+
+/**
+ * Prints of a window split by order size. A caller asks for `bars`, `levels` or both; the
+ * section it did not ask for comes back empty rather than missing.
+ */
+export interface SizeBandSeries {
+  instrument: string;
+  timeframe: string;
+  from: number | null;
+  to: number | null;
+  priceTick: number;
+  /** Venue ticks folded into one level row; 1 is the venue's own price grid. */
+  stepTicks: number;
+  sizeUnit: SizeUnit;
+  /** How the edges were chosen, in words the UI prints rather than infers. */
+  bandRule: string;
+  bands: SizeBand[];
+  bars: SizeBandBar[];
+  levels: SizeBandLevel[];
+  /** The window as a whole, one entry per band. */
+  totals: SizeBandCell[];
+  prints: number;
+  totalQty: number;
+  delta: number;
+}
+
 export interface Coverage {
   bars: number;
   instruments: number;

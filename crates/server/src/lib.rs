@@ -157,6 +157,7 @@ pub async fn start(config: Config) -> Result<Running, BoxError> {
         .route("/api/trades", axum::routing::get(api::trades))
         .route("/api/footprint", axum::routing::get(api::footprint))
         .route("/api/profile", axum::routing::get(api::profile))
+        .route("/api/cvd-by-size", axum::routing::get(api::size_bands))
         .route(
             "/api/workspaces",
             axum::routing::get(api::workspaces).post(api::save_workspace),

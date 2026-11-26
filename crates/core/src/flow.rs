@@ -239,6 +239,108 @@ fn find_imbalances(cells: &Cells, price_tick: f64, buy: bool) -> Vec<f64> {
     out
 }
 
+/// How a print's size is measured before it is placed in a band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SizeUnit {
+    /// Quote currency traded by the print: price x quantity. The same edges mean the
+    /// same thing on every instrument, which is why it is the default.
+    Notional,
+    /// Base quantity of the print. Only comparable inside one instrument.
+    Quantity,
+}
+
+/// One size band: prints whose size sits in `[min, max)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeBand {
+    /// Lower edge, inclusive. None on the band that takes everything below the first edge.
+    pub min: Option<f64>,
+    /// Upper edge, exclusive. None on the band that takes everything above the last edge.
+    pub max: Option<f64>,
+    /// Label the server chose for the band. The client prints it instead of building its
+    /// own, so the numbers on screen and the numbers in the response cannot drift.
+    pub label: String,
+}
+
+/// Aggressive volume and print count in one band of one group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeBandCell {
+    pub buy_qty: f64,
+    pub sell_qty: f64,
+    pub buy_n: u64,
+    pub sell_n: u64,
+}
+
+impl SizeBandCell {
+    pub fn total(&self) -> f64 {
+        self.buy_qty + self.sell_qty
+    }
+
+    pub fn delta(&self) -> f64 {
+        self.buy_qty - self.sell_qty
+    }
+
+    pub fn prints(&self) -> u64 {
+        self.buy_n + self.sell_n
+    }
+}
+
+/// One bar of volume split by size band, oldest bar first.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeBandBar {
+    pub start: i64,
+    /// One entry per band, in band order, always `bands.len()` long.
+    pub bands: Vec<SizeBandCell>,
+    /// Running buy - sell per band from the first returned bar, one entry per band.
+    pub cumulative: Vec<f64>,
+    pub total_qty: f64,
+    pub delta: f64,
+    pub trades: u64,
+}
+
+/// One price level of volume split by size band, lowest level first.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeBandLevel {
+    /// Bottom edge of the level; one level is `price_tick * step_ticks` wide.
+    pub price: f64,
+    /// One entry per band, in band order, always `bands.len()` long.
+    pub bands: Vec<SizeBandCell>,
+    pub total_qty: f64,
+    pub delta: f64,
+    pub trades: u64,
+}
+
+/// Prints of a window split by size band, grouped by bar and by price level.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeBandSeries {
+    pub instrument: String,
+    pub timeframe: Timeframe,
+    /// Requested window, echoed back so a client can tell what the rows actually cover.
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    pub price_tick: f64,
+    /// Ticks folded into one level row. 1 is the venue's own price grid.
+    pub step_ticks: i64,
+    pub size_unit: SizeUnit,
+    /// How the edges were chosen, in words the client prints verbatim.
+    pub band_rule: String,
+    /// The bands, in order, with the edges and labels the aggregation used.
+    pub bands: Vec<SizeBand>,
+    pub bars: Vec<SizeBandBar>,
+    pub levels: Vec<SizeBandLevel>,
+    /// Everything the window held, per band, in band order.
+    pub totals: Vec<SizeBandCell>,
+    /// Prints the aggregation read.
+    pub prints: u64,
+    pub total_qty: f64,
+    pub delta: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileBucket {

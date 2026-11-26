@@ -5,11 +5,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chartkit_core::{
-    new_id, Alert, AlertKind, AssetClass, FootprintSeries, FootprintSeriesBuilder, Timeframe,
-    VolumeProfile, VolumeProfileBuilder,
+    new_id, Alert, AlertKind, AssetClass, FootprintSeries, FootprintSeriesBuilder, SizeBand,
+    SizeBandBar, SizeBandCell, SizeBandLevel, SizeBandSeries, SizeUnit, Timeframe, VolumeProfile,
+    VolumeProfileBuilder,
 };
 use chartkit_ingest::credentials::venue_from_slug;
-use chartkit_store::{BarFilter, StoreError};
+use chartkit_store::{BarFilter, SizeBandRow, StoreError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -349,7 +350,385 @@ pub async fn profile(
     Ok(Json(serde_json::to_value(profile)?))
 }
 
-// ---------------------------------------------------------------- alerts
+// ---------------------------------------------------------------- size bands
+
+/// Default size ladder, in quote currency per print: a coffee, a tank of gas, a house.
+/// Notional is the unit the bands default to because the same three numbers mean the same
+/// thing on BTC, on SOL and on a stock, and because the ladder does not move when the
+/// window moves — quantiles of the window would re-cut the bands on every pan, which
+/// makes a chart of them unreadable. The edges are the server's, and they travel with the
+/// answer so the client prints them instead of rebuilding them.
+const DEFAULT_SIZE_EDGES: &[f64] = &[1_000.0, 10_000.0, 100_000.0];
+
+/// Named ladders, so a client asks for a size of print by name and still gets edges it did
+/// not invent. `standard` is `DEFAULT_SIZE_EDGES`.
+const SIZE_LADDERS: &[(&str, &[f64])] = &[
+    ("small", &[100.0, 1_000.0, 10_000.0]),
+    ("standard", DEFAULT_SIZE_EDGES),
+    ("block", &[10_000.0, 100_000.0, 1_000_000.0]),
+];
+
+/// Band edges the aggregation will accept. Each edge is one band, one plot line and one
+/// column of the grid, so a long list is a chart nobody can read.
+const SIZE_EDGE_MAX: usize = 8;
+
+#[derive(Deserialize)]
+pub struct SizeBandQuery {
+    pub instrument: String,
+    #[serde(default = "default_timeframe")]
+    pub timeframe: String,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    /// Bars to return; the window is aggregated whole, then trimmed to the newest bars.
+    pub limit: Option<i64>,
+    /// `bars` (default), `levels`, or `both`. Only the section asked for costs a scan.
+    #[serde(default)]
+    pub view: Option<String>,
+    /// Named ladder (`standard`, `small`, `block`) or explicit ascending edges.
+    #[serde(default)]
+    pub bands: Option<String>,
+    /// `notional` (default) or `quantity`.
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// Level row width in venue ticks, for the `levels` view. Same meaning as on
+    /// `/api/profile`.
+    #[serde(default, alias = "tickMultiplier")]
+    pub ticks: Option<i64>,
+    /// Level row width as a price; takes precedence over `ticks`.
+    #[serde(default)]
+    pub step: Option<f64>,
+}
+
+/// Which sections of the answer a caller wants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeBandView {
+    Bars,
+    Levels,
+    Both,
+}
+
+/// Milliseconds in one bar, for the intervals the aggregation can group prints by.
+/// Calendar and count-based intervals align on rules SQL cannot divide its way through,
+/// so they are refused rather than quietly answered with nominal spans.
+fn bar_span_ms(timeframe: Timeframe) -> Result<i64, ApiError> {
+    match timeframe {
+        Timeframe::Second(_) | Timeframe::Minute(_) | Timeframe::Hour(_) | Timeframe::Day(_) => {
+            timeframe.duration_ms().ok_or_else(|| ApiError::BadRequest(format!("{timeframe} has no fixed span")))
+        }
+        other => Err(ApiError::BadRequest(format!(
+            "size bands group prints by time interval; {other} is not one"
+        ))),
+    }
+}
+
+/// The band edges to aggregate with, and the sentence that says how they were chosen.
+fn size_edges(
+    spec: Option<&str>,
+    unit: SizeUnit,
+) -> Result<(Vec<f64>, String), ApiError> {
+    let measure = match unit {
+        SizeUnit::Notional => "quote notional per print",
+        SizeUnit::Quantity => "quantity per print",
+    };
+    let (edges, named) = match spec.filter(|s| !s.is_empty()) {
+        None => (DEFAULT_SIZE_EDGES.to_vec(), Some("standard".to_string())),
+        Some(spec) if spec.contains(',') => {
+            let edges = spec
+                .split(',')
+                .map(|edge| {
+                    let value: f64 = edge
+                        .trim()
+                        .parse()
+                        .map_err(|_| ApiError::BadRequest(format!("band edge {edge} is not a number")))?;
+                    if !value.is_finite() || value <= 0.0 {
+                        return Err(ApiError::BadRequest(format!("band edge {value} must be a positive number")));
+                    }
+                    Ok(value)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            validate_edges(&edges)?;
+            (edges, None)
+        }
+        Some(name) => {
+            let (_, edges) = SIZE_LADDERS
+                .iter()
+                .find(|(ladder, _)| ladder.eq_ignore_ascii_case(name.trim()))
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "unknown band ladder {name}; try {}",
+                        SIZE_LADDERS.iter().map(|(ladder, _)| *ladder).collect::<Vec<_>>().join(", ")
+                    ))
+                })?;
+            (edges.to_vec(), Some(name.trim().to_ascii_lowercase()))
+        }
+    };
+    if unit == SizeUnit::Quantity && named.is_some() {
+        return Err(ApiError::BadRequest(
+            "the named ladders are quote amounts; spell out the quantity edges you want, e.g. bands=0.1,1,10".into(),
+        ));
+    }
+    let rule = match named {
+        Some(ladder) => format!("named ladder {ladder}: {measure}, {edges}", edges = edge_list(&edges)),
+        None => format!("caller's own edges: {measure}, {edges}", edges = edge_list(&edges)),
+    };
+    Ok((edges, rule))
+}
+
+fn validate_edges(edges: &[f64]) -> Result<(), ApiError> {
+    if edges.is_empty() || edges.len() > SIZE_EDGE_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "between 1 and {SIZE_EDGE_MAX} band edges are accepted, got {}",
+            edges.len()
+        )));
+    }
+    if edges.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(ApiError::BadRequest(format!(
+            "band edges must ascend, got {}",
+            edge_list(edges)
+        )));
+    }
+    Ok(())
+}
+
+fn edge_list(edges: &[f64]) -> String {
+    edges.iter().map(|edge| fmt_band_number(*edge)).collect::<Vec<_>>().join(" / ")
+}
+
+/// A band edge written the way a trader reads one: 1k, 10k, 2.5M.
+fn fmt_band_number(value: f64) -> String {
+    let short = |value: f64, scale: f64, suffix: &str| -> String {
+        let scaled = value / scale;
+        let text = if scaled == scaled.round() {
+            format!("{:.0}", scaled)
+        } else {
+            format!("{scaled:.1}")
+        };
+        format!("{text}{suffix}")
+    };
+    if value >= 1_000_000_000.0 {
+        short(value, 1_000_000_000.0, "B")
+    } else if value >= 1_000_000.0 {
+        short(value, 1_000_000.0, "M")
+    } else if value >= 1_000.0 {
+        short(value, 1_000.0, "k")
+    } else if value == value.round() {
+        format!("{:.0}", value)
+    } else {
+        format!("{value}")
+    }
+}
+
+/// Band 0 takes everything under the first edge, the top band everything at or above the
+/// last. A print exactly on an edge belongs to the band above it, which is the same rule
+/// the SQL `CASE` applies.
+fn band_labels(edges: &[f64]) -> Vec<SizeBand> {
+    edges
+        .iter()
+        .enumerate()
+        .map(|(index, edge)| SizeBand {
+            min: if index == 0 { None } else { Some(edges[index - 1]) },
+            max: Some(*edge),
+            label: if index == 0 {
+                format!("under {}", fmt_band_number(*edge))
+            } else {
+                format!("{} to {}", fmt_band_number(edges[index - 1]), fmt_band_number(*edge))
+            },
+        })
+        .chain(std::iter::once(SizeBand {
+            min: edges.last().copied(),
+            max: None,
+            label: format!("{} and up", fmt_band_number(*edges.last().expect("an empty edge list is refused"))),
+        }))
+        .collect()
+}
+
+/// Folds aggregated `(group, band)` rows into one dense cell list per group. A group with
+/// no prints in one band still carries a zero for it, so the client can index by band
+/// without checking whether the answer was dense.
+fn fold_size_bands(rows: &[SizeBandRow], bands: usize) -> Vec<(i64, Vec<SizeBandCell>)> {
+    let mut out: Vec<(i64, Vec<SizeBandCell>)> = Vec::new();
+    for row in rows {
+        // The SQL CASE can only name a band inside the ladder; anything else is a row this
+        // answer has nowhere to put, so it is dropped rather than folded into band 0.
+        let Ok(band) = usize::try_from(row.band) else { continue };
+        if band >= bands {
+            continue;
+        }
+        let cells = match out.last_mut() {
+            Some((group, cells)) if *group == row.group => cells,
+            _ => {
+                out.push((row.group, vec![SizeBandCell::default(); bands]));
+                &mut out.last_mut().expect("just pushed").1
+            }
+        };
+        cells[band] = SizeBandCell {
+            buy_qty: row.buy_qty,
+            sell_qty: row.sell_qty,
+            buy_n: row.buy_n as u64,
+            sell_n: row.sell_n as u64,
+        };
+    }
+    out
+}
+
+/// Prints of a window split by order size. The bands are decided and aggregated in SQL,
+/// so the answer is one row per (bar or level, band) whatever the window holds; the prints
+/// themselves never leave the store.
+pub async fn size_bands(
+    State(state): State<AppState>,
+    Query(query): Query<SizeBandQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let timeframe = query.timeframe.parse::<Timeframe>().map_err(ApiError::BadRequest)?;
+    let bar_ms = bar_span_ms(timeframe)?;
+    let limit = query.limit.unwrap_or(240).clamp(1, 5_000);
+    let unit = match query.unit.as_deref().filter(|u| !u.is_empty()) {
+        None | Some("notional") => SizeUnit::Notional,
+        Some("quantity") => SizeUnit::Quantity,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!("unknown size unit {other}; try notional or quantity")))
+        }
+    };
+    let view = match query.view.as_deref().filter(|v| !v.is_empty()) {
+        None | Some("bars") => SizeBandView::Bars,
+        Some("levels") => SizeBandView::Levels,
+        Some("both") => SizeBandView::Both,
+        Some(other) => return Err(ApiError::BadRequest(format!("unknown view {other}; try bars, levels or both"))),
+    };
+    let (edges, band_rule) = size_edges(query.bands.as_deref(), unit)?;
+    let labels = band_labels(&edges);
+    let instrument = state
+        .db
+        .instrument(&query.instrument)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::NotFound(format!("no instrument {}", query.instrument)))?;
+    let price_tick = instrument.price_tick;
+    let step_ticks = profile_step_ticks(query.step, query.ticks, price_tick)?;
+    if let (Some(from), Some(to)) = (query.from, query.to) {
+        state.prints.request_covering(&instrument, from, to).await;
+    }
+
+    let state = state.clone();
+    let id = query.instrument.clone();
+    let (from, to) = (query.from, query.to);
+    let want_bars = view != SizeBandView::Levels;
+    let want_levels = view != SizeBandView::Bars;
+    let series = tokio::task::spawn_blocking(move || -> Result<SizeBandSeries, StoreError> {
+        let band_rows = want_bars
+            .then(|| state.db.size_band_bars(&id, from, to, &edges, unit, bar_ms))
+            .transpose()?
+            .unwrap_or_default();
+        let level_rows = want_levels
+            .then(|| state.db.size_band_levels(&id, from, to, &edges, unit, price_tick, step_ticks))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(assemble_size_bands(
+            id,
+            timeframe,
+            from,
+            to,
+            price_tick,
+            step_ticks,
+            unit,
+            band_rule,
+            labels,
+            band_rows,
+            level_rows,
+            limit,
+        ))
+    })
+    .await
+    .map_err(|e| ApiError::Task(e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(serde_json::to_value(series)?))
+}
+
+/// Turns aggregated rows into the answer: dense band lists per group, the running delta
+/// per band across the returned bars, and the totals of what is actually on the way back.
+///
+/// The totals follow the bars when there are bars, because that is the window the caller
+/// can see; a `levels` answer totals its own rows instead.
+fn assemble_size_bands(
+    instrument: String,
+    timeframe: Timeframe,
+    from: Option<i64>,
+    to: Option<i64>,
+    price_tick: f64,
+    step_ticks: i64,
+    unit: SizeUnit,
+    band_rule: String,
+    bands: Vec<SizeBand>,
+    band_rows: Vec<SizeBandRow>,
+    level_rows: Vec<SizeBandRow>,
+    limit: i64,
+) -> SizeBandSeries {
+    let count = bands.len();
+    let grouped = fold_size_bands(&band_rows, count);
+    let oldest = grouped.len().saturating_sub(limit as usize);
+    let mut running = vec![0.0f64; count];
+    let bars: Vec<SizeBandBar> = grouped
+        .iter()
+        .skip(oldest)
+        .map(|(start, cells)| {
+            for (index, cell) in cells.iter().enumerate() {
+                running[index] += cell.delta();
+            }
+            SizeBandBar {
+                start: *start,
+                cumulative: running.clone(),
+                total_qty: cells.iter().map(SizeBandCell::total).sum(),
+                delta: cells.iter().map(SizeBandCell::delta).sum(),
+                trades: cells.iter().map(SizeBandCell::prints).sum(),
+                bands: cells.clone(),
+            }
+        })
+        .collect();
+    let levels: Vec<SizeBandLevel> = fold_size_bands(&level_rows, count)
+        .into_iter()
+        .map(|(tick, cells)| SizeBandLevel {
+            price: chartkit_core::tick_price(tick, price_tick),
+            total_qty: cells.iter().map(SizeBandCell::total).sum(),
+            delta: cells.iter().map(SizeBandCell::delta).sum(),
+            trades: cells.iter().map(SizeBandCell::prints).sum(),
+            bands: cells,
+        })
+        .collect();
+
+    // The totals are summed out of the rows being returned, not out of the raw
+    // aggregation, so what a caller reads as the window is what the rows add up to.
+    let source: Vec<&[SizeBandCell]> = if bars.is_empty() {
+        levels.iter().map(|level| level.bands.as_slice()).collect()
+    } else {
+        bars.iter().map(|bar| bar.bands.as_slice()).collect()
+    };
+    let mut totals = vec![SizeBandCell::default(); count];
+    for cells in &source {
+        for (index, cell) in cells.iter().enumerate() {
+            totals[index].buy_qty += cell.buy_qty;
+            totals[index].sell_qty += cell.sell_qty;
+            totals[index].buy_n += cell.buy_n;
+            totals[index].sell_n += cell.sell_n;
+        }
+    }
+    SizeBandSeries {
+        instrument,
+        timeframe,
+        from,
+        to,
+        price_tick,
+        step_ticks,
+        size_unit: unit,
+        band_rule,
+        bands,
+        totals,
+        prints: source.iter().flat_map(|cells| cells.iter()).map(SizeBandCell::prints).sum(),
+        total_qty: source.iter().flat_map(|cells| cells.iter()).map(SizeBandCell::total).sum(),
+        delta: source.iter().flat_map(|cells| cells.iter()).map(SizeBandCell::delta).sum(),
+        bars,
+        levels,
+    }
+}
+
+
 
 /// A rule as a client sends it. The server owns the id, the timestamps and the crossing
 /// state, so a draft carries only what the trader chooses.
@@ -581,5 +960,173 @@ mod tests {
         assert!(profile_step_ticks(Some(f64::NAN), None, 0.01).is_err());
         assert!(profile_step_ticks(None, Some(0), 0.01).is_err());
         assert!(profile_step_ticks(None, Some(-5), 0.01).is_err());
+    }
+
+    fn row(group: i64, band: i64, buy: f64, sell: f64, buy_n: i64, sell_n: i64) -> SizeBandRow {
+        SizeBandRow { group, band, buy_qty: buy, sell_qty: sell, buy_n, sell_n }
+    }
+
+    /// The same window as the aggregation would return it: two bars, three bands.
+    fn two_bars() -> (Vec<SizeBand>, Vec<SizeBandRow>) {
+        let edges = [1_000.0, 10_000.0, 100_000.0];
+        let labels = band_labels(&edges);
+        let rows = vec![
+            row(0, 0, 3.0, 1.0, 5, 2),
+            row(0, 1, 2.0, 0.0, 1, 0),
+            row(0, 3, 0.0, 4.0, 0, 1),
+            row(60_000, 0, 1.0, 1.0, 1, 1),
+            row(60_000, 2, 5.0, 0.0, 2, 0),
+        ];
+        (labels, rows)
+    }
+
+    fn answer(labels: Vec<SizeBand>, rows: Vec<SizeBandRow>, limit: i64) -> SizeBandSeries {
+        assemble_size_bands(
+            "BINANCE:BTCUSDT".into(),
+            Timeframe::Minute(1),
+            Some(0),
+            Some(120_000),
+            0.01,
+            1,
+            SizeUnit::Notional,
+            "test".into(),
+            labels,
+            rows,
+            Vec::new(),
+            limit,
+        )
+    }
+
+    #[test]
+    fn the_bands_of_a_bar_add_up_to_the_plain_delta_and_volume_of_that_bar() {
+        let (labels, rows) = two_bars();
+        let series = answer(labels, rows, 240);
+        assert_eq!(series.bars.len(), 2);
+        assert_eq!(series.bars[0].bands.len(), 4, "a band with no prints still occupies a slot");
+
+        // The check the whole feature rests on: splitting a bar by size may not move a
+        // coin. Every band's delta summed is the bar's delta, and so is its volume.
+        let first = &series.bars[0];
+        let band_delta: f64 = first.bands.iter().map(SizeBandCell::delta).sum();
+        let band_volume: f64 = first.bands.iter().map(SizeBandCell::total).sum();
+        let band_prints: u64 = first.bands.iter().map(SizeBandCell::prints).sum();
+        assert_eq!(band_delta, 3.0 - 1.0 + 2.0 - 4.0, "the bands do not sum to the bar delta");
+        assert_eq!(band_delta, first.delta);
+        assert_eq!(band_volume, first.total_qty);
+        assert_eq!(band_prints, first.trades);
+        assert_eq!((first.total_qty, first.trades), (10.0, 9));
+
+        let second = &series.bars[1];
+        assert_eq!((second.delta, second.total_qty, second.trades), (5.0, 7.0, 4));
+        assert!(second.bands.iter().map(|cell| cell.total()).sum::<f64>() == second.total_qty);
+
+        assert_eq!((series.total_qty, series.delta, series.prints), (17.0, 5.0, 13));
+        let totals: f64 = series.totals.iter().map(SizeBandCell::delta).sum();
+        assert_eq!(totals, series.delta, "the per-band totals must add up to the window delta");
+    }
+
+    #[test]
+    fn the_running_delta_per_band_follows_the_bars_it_is_handed_with() {
+        let (labels, rows) = two_bars();
+        let series = answer(labels.clone(), rows.clone(), 240);
+        // Bar one: +2 on the retail band, +2 on the mid band, -4 on the block band.
+        assert_eq!(series.bars[0].cumulative, vec![2.0, 2.0, 0.0, -4.0]);
+        // Bar two adds 0, 0, +5, 0 on top of those.
+        assert_eq!(series.bars[1].cumulative, vec![2.0, 2.0, 5.0, -4.0]);
+        let last = series.bars.last().expect("bars").cumulative.clone();
+        let totals: Vec<f64> = series.totals.iter().map(SizeBandCell::delta).collect();
+        assert_eq!(last, totals, "the line has to end where the totals say it does");
+
+        // Dropping the oldest bar restarts the line at the bar that survives the trim.
+        let trimmed = answer(labels, rows, 1);
+        assert_eq!(trimmed.bars.len(), 1);
+        assert_eq!(trimmed.bars[0].start, 60_000);
+        assert_eq!(trimmed.bars[0].cumulative, vec![0.0, 0.0, 5.0, 0.0]);
+        assert_eq!((trimmed.total_qty, trimmed.delta, trimmed.prints), (7.0, 5.0, 4));
+    }
+
+    #[test]
+    fn the_default_ladder_is_named_in_the_answer_rather_than_guessed_by_the_caller() {
+        let (edges, rule) = size_edges(None, SizeUnit::Notional).expect("default ladder");
+        assert_eq!(edges, DEFAULT_SIZE_EDGES.to_vec());
+        assert!(rule.contains("standard"), "{rule}");
+        assert!(rule.contains("quote notional per print"), "{rule}");
+        assert!(rule.contains("1k / 10k / 100k"), "{rule}");
+
+        let labels = band_labels(&edges);
+        assert_eq!(
+            labels.iter().map(|band| band.label.as_str()).collect::<Vec<_>>(),
+            vec!["under 1k", "1k to 10k", "10k to 100k", "100k and up"]
+        );
+        assert_eq!(labels[0].min, None, "the bottom band has no floor");
+        assert_eq!(labels[0].max, Some(1_000.0));
+        assert_eq!(labels[3].max, None, "the top band has no ceiling");
+        assert_eq!(labels[3].min, Some(100_000.0));
+    }
+
+    #[test]
+    fn a_caller_may_ask_for_another_ladder_by_name_or_by_number() {
+        let (edges, rule) = size_edges(Some("BLOCK"), SizeUnit::Notional).expect("named ladder");
+        assert_eq!(edges, vec![10_000.0, 100_000.0, 1_000_000.0]);
+        assert!(rule.contains("named ladder block"), "{rule}");
+
+        let (edges, rule) = size_edges(Some(" 0.25, 2 , 250 "), SizeUnit::Quantity).expect("own edges");
+        assert_eq!(edges, vec![0.25, 2.0, 250.0]);
+        assert!(rule.contains("quantity per print"), "{rule}");
+        assert!(rule.contains("0.25 / 2 / 250"), "{rule}");
+    }
+
+    #[test]
+    fn a_ladder_that_cannot_be_aggregated_is_refused_with_a_reason() {
+        // Not ascending: the SQL CASE tests the edges in order, so an unsorted list would
+        // silently swallow the bands behind it.
+        assert!(size_edges(Some("10000,1000,100000"), SizeUnit::Notional).is_err());
+        assert!(size_edges(Some("1000,1000"), SizeUnit::Notional).is_err());
+        assert!(size_edges(Some("0,1000"), SizeUnit::Notional).is_err());
+        assert!(size_edges(Some("-5"), SizeUnit::Notional).is_err());
+        assert!(size_edges(Some("big"), SizeUnit::Notional).is_err());
+        assert!(size_edges(Some("not-a-number,1"), SizeUnit::Notional).is_err());
+        assert!(size_edges(Some("1,2,3,4,5,6,7,8,9"), SizeUnit::Notional).is_err(), "nine bands is a wall");
+        // The named ladders are quote amounts, so they cannot describe a quantity.
+        assert!(size_edges(Some("standard"), SizeUnit::Quantity).is_err());
+    }
+
+    #[test]
+    fn a_size_is_written_the_way_a_trader_reads_it() {
+        assert_eq!(fmt_band_number(1_000.0), "1k");
+        assert_eq!(fmt_band_number(2_500.0), "2.5k");
+        assert_eq!(fmt_band_number(100_000.0), "100k");
+        assert_eq!(fmt_band_number(1_000_000.0), "1M");
+        assert_eq!(fmt_band_number(1_500_000_000.0), "1.5B");
+        assert_eq!(fmt_band_number(5.0), "5");
+        assert_eq!(fmt_band_number(0.25), "0.25");
+    }
+
+    #[test]
+    fn only_intervals_with_a_fixed_span_can_be_grouped_by_time() {
+        assert_eq!(bar_span_ms(Timeframe::Minute(1)).expect("1m"), 60_000);
+        assert_eq!(bar_span_ms(Timeframe::Minute(5)).expect("5m"), 300_000);
+        assert_eq!(bar_span_ms(Timeframe::Hour(1)).expect("1h"), 3_600_000);
+        assert_eq!(bar_span_ms(Timeframe::Day(1)).expect("1d"), 86_400_000);
+        assert!(bar_span_ms(Timeframe::Month(1)).is_err());
+        assert!(bar_span_ms(Timeframe::Tick(100)).is_err());
+        // Weeks align against a Sunday epoch, which a plain division would miss.
+        assert!(bar_span_ms(Timeframe::Week(1)).is_err());
+    }
+
+    #[test]
+    fn a_fold_is_dense_and_keeps_every_group_it_was_given() {
+        let (labels, rows) = two_bars();
+        let folded = fold_size_bands(&rows, labels.len());
+        assert_eq!(folded.len(), 2, "both bars survive");
+        assert!(folded.iter().all(|(_, cells)| cells.len() == 4));
+        assert_eq!(folded[0].1[2], SizeBandCell::default(), "an empty band reads as a zero");
+        assert_eq!(folded[1].1[1], SizeBandCell::default());
+
+        // A band index outside the ladder cannot index out of the dense row.
+        let stray = vec![row(0, 9, 1.0, 0.0, 1, 0), row(0, -1, 1.0, 0.0, 1, 0), row(0, 0, 2.0, 0.0, 1, 0)];
+        let folded = fold_size_bands(&stray, 4);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].1[0].buy_qty, 2.0, "the band that exists still gets its volume");
     }
 }
